@@ -1,7 +1,7 @@
 {
-  "name": "@sentinel/plugin",
+  "name": "@sentrinel/plugin",
   "version": "0.1.0",
-  "description": "Sentinel monitoring plugin for Elysia.js — exact metrics, sampled request logs, error tracking, console log capture, and resource usage, flushed to a self-hosted Sentinel server.",
+  "description": "Sentrinel monitoring plugin for Elysia.js — exact metrics, sampled request logs, error tracking, console log capture, and resource usage, flushed to a self-hosted Sentrinel server.",
   "license": "MIT",
   "author": "Zaga Ltd",
   "repository": {
@@ -34,6 +34,7 @@
     "elysia": ">=1.0.0"
   },
   "devDependencies": {
-    "elysia": "^1.2.0"
+    "elysia": "^1.2.0",
+    "@types/bun": "^1.3.14"
   }
 }

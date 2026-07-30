@@ -1,25 +1,73 @@
 import { Elysia } from "elysia";
 import { MetricsCollector } from "./collector";
 import { maskQueryParams, maskHeaders, maskBodyFields, truncateBody } from "./masking";
-import type { SentinelPluginOptions, RequestLogEntry } from "./types";
+import type { SentrinelPluginOptions, RequestLogEntry } from "./types";
 import { shouldCaptureLog } from "./sampling";
 import { instrumentConsole, beginRequestLogContext, drainRequestLogs } from "./logs";
+import {
+  setLogSink,
+  setLogEcho as applyLogEcho,
+  setLogLevel as applyLogLevel,
+  setCorrelationSource,
+  enterRequestScope,
+  currentRequestId,
+  beginCanonicalScope,
+  drainCanonicalFields,
+  type LogRecord,
+} from "./logger";
+import {
+  traceStorage,
+  generateTraceId,
+  generateSpanId,
+  parseTraceParent,
+  type TraceContext,
+} from "./tracer";
 
-export type { SentinelPluginOptions, RequestLoggingOptions } from "./types";
+export type { SentrinelPluginOptions, RequestLoggingOptions } from "./types";
+export {
+  traceSpan,
+  tspan,
+  traced,
+  traceObject,
+  sentrinelFetch,
+  generateTraceId,
+  generateSpanId,
+  generateUuidV7,
+  parseTraceParent,
+  createTraceParentHeader,
+  createClientTracer,
+} from "./tracer";
+export {
+  getLogger,
+  logger,
+  withContext,
+  addContext,
+  currentContext,
+  clearRequestScope,
+  addRequestContext,
+  setLogEcho,
+  setLogLevel,
+  type Logger,
+  type LogRecord,
+  type LogContext,
+} from "./logger";
+export { sentrinelExpressMiddleware } from "./express";
+export { sentrinelNextMiddleware } from "./next";
+export { createFlutterHeaderMap } from "./flutter";
 
 /**
- * Sentinel Elysia Plugin
+ * Sentrinel Elysia Plugin
  *
  * Instruments your Elysia application with API monitoring, metrics collection,
- * request logging, and error tracking. Data is sent to a Sentinel API server
- * for visualization in the Sentinel dashboard.
+ * request logging, and error tracking. Data is sent to a Sentrinel API server
+ * for visualization in the Sentrinel dashboard.
  *
  * @example
  * ```ts
- * import { sentinelPlugin } from '@sentinel/plugin';
+ * import { sentrinelPlugin } from '@sentrinel/plugin';
  *
  * const app = new Elysia()
- *   .use(sentinelPlugin({
+ *   .use(sentrinelPlugin({
  *     serverUrl: 'http://localhost:3001',
  *     appName: 'my-api',
  *     env: 'prod',
@@ -35,7 +83,7 @@ export type { SentinelPluginOptions, RequestLoggingOptions } from "./types";
  *   }))
  * ```
  */
-export function sentinelPlugin(options: SentinelPluginOptions) {
+export function sentrinelPlugin(options: SentrinelPluginOptions) {
   const collector = new MetricsCollector(options);
   const maxBodySize = options.requestLogging?.maxBodySize ?? 65_536; // 64KB default
   const excludePatterns = (options.excludePaths || []).map((p) =>
@@ -45,7 +93,41 @@ export function sentinelPlugin(options: SentinelPluginOptions) {
   return (app: any) => {
     collector.start();
     if (options.logCapture?.enabled) instrumentConsole(options.logCapture);
-    if (options.debug) console.log("[sentinel] Plugin initialized for", options.appName);
+
+    // ─── Structured logging ────────────────────────────────────────────────
+    //
+    // Records from getLogger() go straight to the collector's buffer. The
+    // correlation source lets the logger stamp every record with the active
+    // request/trace/span without importing the plugin (which would cycle).
+    if (options.logging?.echo) applyLogEcho(true);
+    if (options.logging?.minLevel) applyLogLevel(options.logging.minLevel);
+    setCorrelationSource(() => {
+      const trace = traceStorage.getStore();
+      return {
+        requestId: currentRequestId(),
+        traceId: trace?.traceId,
+        // The span running right now, so a log written inside traceSpan()
+        // attaches to that span rather than to the request as a whole.
+        spanId: trace?.currentSpanId,
+      };
+    });
+    const ownSink = (record: LogRecord) => {
+      collector.recordAppLogs([
+        {
+          timestamp: record.timestamp,
+          level: record.level,
+          message: record.message,
+          category: record.category,
+          attributes: record.attributes,
+          requestId: record.requestId,
+          traceId: record.traceId,
+          spanId: record.spanId,
+        },
+      ]);
+    };
+    // Logs written outside a request go to the first plugin that registered.
+    setLogSink(ownSink);
+    if (options.debug) console.log("[sentrinel] Plugin initialized for", options.appName);
 
     app.onStop(async () => {
       await collector.stop();
@@ -54,17 +136,61 @@ export function sentinelPlugin(options: SentinelPluginOptions) {
     app.derive(({ request }: any) => {
       const requestLogId = crypto.randomUUID();
       if (options.logCapture?.enabled) beginRequestLogContext(requestLogId);
-      return {
-        _sentinelStartTime: performance.now(),
-        _sentinelRequestUrl: new URL(request.url),
-        _sentinelRequestLogId: requestLogId,
+
+      // Open a trace context for this request.
+      //
+      // Without this, traceSpan()/traced() find no store and silently record
+      // nothing — the entire tracing feature was inert for Elysia apps. An
+      // incoming traceparent is honoured so a trace started upstream continues
+      // through this service instead of being split in two.
+      const incoming = parseTraceParent(request.headers.get("traceparent"));
+      const traceCtx: TraceContext = {
+        traceId: incoming?.traceId ?? generateTraceId(),
+        rootSpanId: generateSpanId(),
+        currentSpanId: "",
+        spans: [],
       };
+      traceCtx.currentSpanId = incoming?.parentSpanId ?? traceCtx.rootSpanId;
+      // enterWith keeps the store for the rest of this request's async work,
+      // which is what handlers run inside.
+      traceStorage.enterWith(traceCtx);
+      // Same for the request id, so every structured log written while handling
+      // this request knows which request it belongs to.
+      enterRequestScope(requestLogId, ownSink);
+      // Collects business context for this request's canonical event.
+      beginCanonicalScope();
+
+      return {
+        _sentrinelStartTime: performance.now(),
+        _sentrinelRequestUrl: new URL(request.url),
+        _sentrinelRequestLogId: requestLogId,
+        _sentrinelTrace: traceCtx,
+        _sentrinelTraceStart: new Date().toISOString(),
+      };
+    });
+
+    // Thrown exceptions never reach afterResponse with their stack intact —
+    // Elysia has already turned them into a response by then. Capturing the
+    // real Error here is what makes stack-trace fingerprinting (and therefore
+    // issue grouping) work for genuine crashes rather than only for handlers
+    // that happen to *return* an error-shaped object.
+    app.onError((ctx: any) => {
+      try {
+        const err = ctx.error;
+        if (err instanceof Error) {
+          (ctx as any)._sentrinelError = {
+            name: err.name,
+            message: err.message,
+            stack: err.stack,
+          };
+        }
+      } catch {}
     });
 
     app.onAfterResponse(async (ctx: any) => {
       try {
-        const startTime = (ctx as any)._sentinelStartTime as number;
-        const requestUrl = (ctx as any)._sentinelRequestUrl as URL;
+        const startTime = (ctx as any)._sentrinelStartTime as number;
+        const requestUrl = (ctx as any)._sentrinelRequestUrl as URL;
         if (!startTime || !requestUrl) return;
 
         const responseTime = performance.now() - startTime;
@@ -98,10 +224,13 @@ export function sentinelPlugin(options: SentinelPluginOptions) {
 
         // Get consumer identifier
         let consumerIdentifier: string | null | undefined = null;
-        if (options.consumerIdentifier) {
+        if (typeof options.consumerIdentifier === "function") {
           try {
             consumerIdentifier = options.consumerIdentifier(ctx);
           } catch {}
+        } else if (typeof options.consumerIdentifier === "string") {
+          // Header-name shorthand, matching the Express/Next adapters.
+          consumerIdentifier = ctx.request.headers.get(options.consumerIdentifier.toLowerCase());
         }
 
         // Record metrics
@@ -115,13 +244,29 @@ export function sentinelPlugin(options: SentinelPluginOptions) {
           consumerIdentifier,
         });
 
+        const requestLogId = (ctx as any)._sentrinelRequestLogId as string;
+        const traceId = (ctx as any)._sentrinelTrace?.traceId as string | undefined;
+        // Drained once, here: both the error row and the request row want it,
+        // and draining twice would leave the second one empty.
+        const canonicalFields = drainCanonicalFields();
+
         // Record errors
         if (statusCode >= 400) {
           let errorMessage: string | undefined;
           let errorType: string | undefined;
           let stackTrace: string | undefined;
 
-          if (ctx.response && typeof ctx.response === "object") {
+          // A real thrown Error (captured in onError) always wins — it is the
+          // only source with a usable stack trace.
+          const thrown = (ctx as any)._sentrinelError as
+            | { name: string; message: string; stack?: string }
+            | undefined;
+
+          if (thrown) {
+            errorType = thrown.name;
+            errorMessage = thrown.message;
+            stackTrace = thrown.stack;
+          } else if (ctx.response && typeof ctx.response === "object") {
             const resp = ctx.response as any;
             errorMessage = resp.message || resp.error || undefined;
             errorType = resp.name || resp.type || undefined;
@@ -140,6 +285,11 @@ export function sentinelPlugin(options: SentinelPluginOptions) {
             stackTrace,
             consumerIdentifier,
             timestamp: new Date().toISOString(),
+            // The links that let an issue occurrence open the request that
+            // produced it, and that request's waterfall.
+            requestLogId,
+            traceId,
+            attributes: canonicalFields,
           });
         }
 
@@ -148,12 +298,55 @@ export function sentinelPlugin(options: SentinelPluginOptions) {
         // Metrics above are already recorded, so counters stay exact no
         // matter the sample rate. Errors and slow requests always pass.
         // Drain app logs captured while handling this request.
-        const requestLogId = (ctx as any)._sentinelRequestLogId as string;
         const drained = options.logCapture?.enabled
           ? drainRequestLogs()
           : { logs: [], dropped: 0 };
         const hasErrorLogs = drained.logs.some((l) => l.level === "error");
         if (drained.logs.length) collector.recordAppLogs(drained.logs);
+
+        // ─── Ship the trace ────────────────────────────────────────────────
+        //
+        // Spans collected by traceSpan()/traced() during the handler, plus a
+        // root span for the HTTP request itself so the waterfall always has
+        // something to nest under.
+        //
+        // Emitted for EVERY request, not only ones that opened child spans.
+        // Logs and error records both carry this trace id, so skipping the
+        // trace would leave them pointing at something that does not exist —
+        // "open the waterfall" would 404. A request with no child spans still
+        // has a real trace: the HTTP span itself.
+        const traceCtx = (ctx as any)._sentrinelTrace as TraceContext | undefined;
+        if (traceCtx) {
+          const traceStart = (ctx as any)._sentrinelTraceStart as string;
+          const startMs = new Date(traceStart).getTime();
+          const rootSpan = {
+            id: traceCtx.rootSpanId,
+            traceId: traceCtx.traceId,
+            parentId: null,
+            name: `${method} ${routePath}`,
+            kind: "SERVER",
+            startTime: traceStart,
+            endTime: new Date(startMs + responseTime).toISOString(),
+            durationMs: Math.round(responseTime * 100) / 100,
+            statusCode: statusCode >= 500 ? "ERROR" : "OK",
+            attributes: {
+              "http.method": method,
+              "http.route": routePath,
+              "http.status_code": statusCode,
+              ...(consumerIdentifier ? { "sentrinel.consumer": consumerIdentifier } : {}),
+            },
+          };
+          collector.recordTrace({
+            traceId: traceCtx.traceId,
+            requestLogId: requestLogId,
+            name: `${method} ${routePath}`,
+            startTime: traceStart,
+            endTime: new Date(startMs + responseTime).toISOString(),
+            durationMs: Math.round(responseTime * 100) / 100,
+            statusCode,
+            spans: [rootSpan, ...traceCtx.spans],
+          });
+        }
 
         if (options.requestLogging?.enabled) {
           const decision = shouldCaptureLog(
@@ -177,12 +370,17 @@ export function sentinelPlugin(options: SentinelPluginOptions) {
             consumerIdentifier,
             timestamp: new Date().toISOString(),
             sampleRate: hasErrorLogs ? 1 : decision.sampleRate,
+            // Links the row to its trace so the Trace tab can resolve it.
+            traceId,
+            // Whatever the handler attached via addRequestContext() — the
+            // business half of the canonical event.
+            attributes: canonicalFields,
           };
 
           // Log headers (masked)
           if (options.requestLogging.logRequestHeaders) {
             const rawHeaders: Record<string, string> = {};
-            ctx.request.headers.forEach((value, key) => {
+            ctx.request.headers.forEach((value: string, key: string) => {
               rawHeaders[key] = value;
             });
             entry.requestHeaders = options.requestLogging.maskHeaders
@@ -201,15 +399,20 @@ export function sentinelPlugin(options: SentinelPluginOptions) {
               : queryObj;
           }
 
-          // Log request body (masked + truncated)
-          if (options.requestLogging.logRequestBody) {
+          // Log request body (masked + truncated).
+          //
+          // Read from ctx.body — the value Elysia already parsed — rather than
+          // request.clone().text(). By the time afterResponse runs the original
+          // stream is consumed, so the clone yields nothing and every POST body
+          // silently came through empty.
+          if (options.requestLogging.logRequestBody && ctx.body !== undefined && ctx.body !== null) {
             try {
-              const clonedReq = ctx.request.clone();
-              const bodyText = await clonedReq.text();
-              if (bodyText) {
+              const raw =
+                typeof ctx.body === "string" ? ctx.body : JSON.stringify(ctx.body);
+              if (raw && raw !== "{}") {
                 let maskedBody = options.requestLogging.maskBodyFields
-                  ? maskBodyFields(bodyText, options.requestLogging.maskBodyFields)
-                  : bodyText;
+                  ? maskBodyFields(raw, options.requestLogging.maskBodyFields)
+                  : raw;
                 if (typeof maskedBody === "object") maskedBody = JSON.stringify(maskedBody);
                 entry.requestBody = truncateBody(maskedBody, maxBodySize);
               }
@@ -244,8 +447,9 @@ export function sentinelPlugin(options: SentinelPluginOptions) {
 
           collector.recordRequestLog(entry);
         }
+
       } catch (err) {
-        if (options.debug) console.error("[sentinel] Error in afterResponse hook:", err);
+        if (options.debug) console.error("[sentrinel] Error in afterResponse hook:", err);
       }
     });
 

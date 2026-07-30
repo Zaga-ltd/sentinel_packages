@@ -1,6 +1,6 @@
-# @sentinel/plugin
+# @sentrinel/plugin
 
-Monitoring plugin for [Elysia.js](https://elysiajs.com) apps. Sends metrics, request logs, errors, application logs, and resource usage to a self-hosted [Sentinel](https://github.com/Zaga-ltd/sentinel) server.
+Monitoring plugin for [Elysia.js](https://elysiajs.com) apps. Sends metrics, request logs, errors, application logs, and resource usage to a self-hosted [Sentrinel](https://github.com/Zaga-ltd/sentinel) server.
 
 - **Exact metrics** — request counts, error rates, and response-time percentiles are aggregated in-process before sampling, so dashboards are always accurate.
 - **Sampled request logs** — keep a fraction of successful requests; errors, slow requests, and requests that logged an error are always kept.
@@ -12,19 +12,19 @@ Monitoring plugin for [Elysia.js](https://elysiajs.com) apps. Sends metrics, req
 ## Install
 
 ```bash
-bun add "@sentinel/plugin@github:Zaga-ltd/sentinel_packages"
+bun add "@sentrinel/plugin@github:Zaga-ltd/sentinel_packages"
 ```
 
 ## Usage
 
 ```ts
 import { Elysia } from "elysia";
-import { sentinelPlugin } from "@sentinel/plugin";
+import { sentrinelPlugin } from "@sentrinel/plugin";
 
 const app = new Elysia()
   .use(
-    sentinelPlugin({
-      serverUrl: "http://localhost:3001",   // your Sentinel API server
+    sentrinelPlugin({
+      serverUrl: "http://localhost:3001",   // your Sentrinel API server
       appName: "my-api",
       env: "production",
       apiKey: process.env.SENTINEL_API_KEY, // per-app ingest key
@@ -56,7 +56,7 @@ Requests that emit `console.error` are never sampled out, even when they return 
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `serverUrl` | — | Sentinel API server base URL |
+| `serverUrl` | — | Sentrinel API server base URL |
 | `appName` | — | App name shown in the dashboard |
 | `env` | `"dev"` | Environment label |
 | `apiKey` | — | Ingest API key (required when the server enforces keys) |

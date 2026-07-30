@@ -1,7 +1,7 @@
-// ─── Sentinel Plugin Types ──────────────────────────────────────────────────────
+// ─── Sentrinel Plugin Types ──────────────────────────────────────────────────────
 
-export interface SentinelPluginOptions {
-  /** URL of the Sentinel API server (e.g., "http://localhost:3001") */
+export interface SentrinelPluginOptions {
+  /** URL of the Sentrinel API server (e.g., "http://localhost:3001") */
   serverUrl: string;
 
   /** Name of this application */
@@ -10,7 +10,7 @@ export interface SentinelPluginOptions {
   /** Environment (e.g., "dev", "staging", "prod") */
   env?: string;
 
-  /** API key for authentication with the Sentinel server */
+  /** API key for authentication with the Sentrinel server */
   apiKey?: string;
 
   /** Flush interval in milliseconds (default: 30000) */
@@ -26,8 +26,31 @@ export interface SentinelPluginOptions {
    */
   logCapture?: import("./logs").LogCaptureOptions;
 
-  /** Function to extract consumer identifier from request context */
-  consumerIdentifier?: (ctx: any) => string | null | undefined;
+  /**
+   * Structured logging via getLogger(). Records are correlated to the active
+   * request, trace and span automatically and shipped with the normal flush.
+   */
+  logging?: {
+    /** Drop records below this level before they are buffered. */
+    minLevel?: import("./logs").LogLevel;
+    /**
+     * Also print each record to stdout. Off by default — your app owns its
+     * console output, and duplicating it surprises people in production.
+     */
+    echo?: boolean;
+  };
+  /**
+   * App version (e.g. a git SHA or semver). Reported on every metrics flush;
+   * a change is recorded as a deployment and annotated on every chart.
+   */
+  version?: string;
+
+  /**
+   * How to identify the API client behind a request: either a header name
+   * (the framework adapters read it straight off the request) or a function
+   * that derives one from the request context.
+   */
+  consumerIdentifier?: string | ((ctx: any) => string | null | undefined);
 
   /** Paths to exclude from monitoring (regex patterns) */
   excludePaths?: (string | RegExp)[];
@@ -111,23 +134,33 @@ export interface RequestLogEntry {
   responseTime: number;
   requestSize: number;
   responseSize: number;
-  env: string;
+  /** Filled in from plugin options at flush time when the adapter omits it. */
+  env?: string;
   consumerIdentifier?: string | null;
   requestHeaders?: Record<string, string>;
   requestBody?: string;
   responseBody?: string;
   queryParams?: Record<string, string>;
   errorMessage?: string;
+  /** Links this request to a distributed trace; the API stores it on the row. */
+  traceId?: string;
+  /**
+   * Business context attached via addRequestContext() — tier, customer id,
+   * feature flags. Turns the request row into a canonical wide event.
+   */
+  attributes?: Record<string, unknown>;
   timestamp: string;
   /** Effective sampling rate this entry was captured at (1 = unsampled). */
   sampleRate?: number;
 }
 
-// ─── Payloads sent to Sentinel API ──────────────────────────────────────────────
+// ─── Payloads sent to Sentrinel API ──────────────────────────────────────────────
 
 export interface MetricsPayload {
   appName: string;
   env: string;
+  /** App version, when configured — drives deploy markers. */
+  version?: string;
   timestamp: string;
   endpoints: {
     method: string;
@@ -173,8 +206,19 @@ export interface AppLogsPayload {
   logs: Array<{
     timestamp: string;
     level: string;
+    /** Stable message; placeholders are NOT interpolated so it groups. */
     message: string;
+    /** Dotted logger category, e.g. "api.checkout". */
+    category?: string;
+    /** Structured fields — what you actually filter and group by. */
+    attributes?: Record<string, unknown>;
     requestId?: string;
+    /** Correlates the line to a distributed trace… */
+    traceId?: string;
+    /** …and to the exact span that was running when it was written. */
+    spanId?: string;
+    /** Ordering within a request when timestamps collide. */
+    seq?: number;
   }>;
 }
 
@@ -191,5 +235,11 @@ export interface ErrorPayload {
     stackTrace?: string;
     consumerIdentifier?: string | null;
     timestamp: string;
+    /** The request this error came out of, so an issue can open it. */
+    requestLogId?: string;
+    /** …and its trace, so an issue can open the waterfall. */
+    traceId?: string;
+    /** Business context attached with addRequestContext(). */
+    attributes?: Record<string, unknown>;
   }[];
 }

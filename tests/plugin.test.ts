@@ -1,17 +1,18 @@
 import { describe, expect, it, beforeEach, mock, spyOn } from "bun:test";
 import { Elysia } from "elysia";
-import { sentinelPlugin } from "../src/index";
+import { sentrinelPlugin } from "../src/index";
 
-describe("Sentinel Plugin", () => {
+describe("Sentrinel Plugin", () => {
   beforeEach(() => {
     // Reset any mocks or state if necessary
   });
 
   it("should initialize with default config", async () => {
     const app = new Elysia().use(
-      sentinelPlugin({
-        appId: "test-app-id",
+      sentrinelPlugin({
+        appName: "test-app",
         apiKey: "test-api-key",
+        serverUrl: "http://localhost:3001",
       })
     );
 
@@ -21,9 +22,10 @@ describe("Sentinel Plugin", () => {
   it("should collect metrics on request", async () => {
     const app = new Elysia()
       .use(
-        sentinelPlugin({
-          appId: "test-app-id",
+        sentrinelPlugin({
+          appName: "test-app",
           apiKey: "test-api-key",
+          serverUrl: "http://localhost:3001",
         })
       )
       .get("/hello", () => "world");
@@ -40,9 +42,10 @@ describe("Sentinel Plugin", () => {
   it("should mask sensitive data when configured", async () => {
     const app = new Elysia()
       .use(
-        sentinelPlugin({
-          appId: "test-app-id",
+        sentrinelPlugin({
+          appName: "test-app",
           apiKey: "test-api-key",
+          serverUrl: "http://localhost:3001",
           requestLogging: {
             enabled: true,
             maskQueryParams: [/^password$/i],

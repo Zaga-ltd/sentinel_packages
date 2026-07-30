@@ -21,9 +21,9 @@ function matchesPattern(fieldName: string, patterns: (string | RegExp)[]): boole
  */
 export function maskQueryParams(
   params: Record<string, string> | undefined | null,
-  patterns: (string | RegExp)[]
+  patterns?: (string | RegExp)[]
 ): Record<string, string> | undefined {
-  if (!params || patterns.length === 0) return params ?? undefined;
+  if (!params || !patterns?.length) return params ?? undefined;
 
   const masked: Record<string, string> = {};
   for (const [key, value] of Object.entries(params)) {
@@ -37,9 +37,9 @@ export function maskQueryParams(
  */
 export function maskHeaders(
   headers: Record<string, string> | undefined | null,
-  patterns: (string | RegExp)[]
+  patterns?: (string | RegExp)[]
 ): Record<string, string> | undefined {
-  if (!headers || patterns.length === 0) return headers ?? undefined;
+  if (!headers || !patterns?.length) return headers ?? undefined;
 
   const masked: Record<string, string> = {};
   for (const [key, value] of Object.entries(headers)) {
@@ -53,9 +53,9 @@ export function maskHeaders(
  */
 export function maskBodyFields(
   body: any,
-  patterns: (string | RegExp)[]
+  patterns?: (string | RegExp)[]
 ): any {
-  if (!body || patterns.length === 0) return body;
+  if (!body || !patterns?.length) return body;
 
   if (typeof body === "string") {
     try {
@@ -104,7 +104,10 @@ function maskObjectFields(
 /**
  * Truncate a body string to the maximum allowed size
  */
-export function truncateBody(body: string | undefined | null, maxSize: number): string | undefined {
+export function truncateBody(
+  body: string | undefined | null,
+  maxSize: number = 10_000
+): string | undefined {
   if (!body) return undefined;
   if (body.length <= maxSize) return body;
   return body.slice(0, maxSize) + `... [truncated, ${body.length} bytes total]`;

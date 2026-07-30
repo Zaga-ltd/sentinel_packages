@@ -1,5 +1,5 @@
 import type {
-  SentinelPluginOptions,
+  SentrinelPluginOptions,
   EndpointMetrics,
   ConsumerRequestMetrics,
   RequestLogEntry,
@@ -10,7 +10,7 @@ import type {
 } from "./types";
 
 // ─── Metrics Collector ──────────────────────────────────────────────────────────
-// Buffers metrics in memory and flushes to the Sentinel API server periodically
+// Buffers metrics in memory and flushes to the Sentrinel API server periodically
 
 export class MetricsCollector {
   private endpointMetrics: Map<string, EndpointMetrics> = new Map();
@@ -18,14 +18,17 @@ export class MetricsCollector {
   private requestLogBuffer: RequestLogEntry[] = [];
   private appLogBuffer: AppLogsPayload["logs"] = [];
   private errorBuffer: ErrorPayload["errors"] = [];
+  private traceBuffer: any[] = [];
   private flushTimer: ReturnType<typeof setInterval> | null = null;
-  private options: SentinelPluginOptions;
+  private options: SentrinelPluginOptions;
   private isFlushing = false;
+  /** Problems already reported, so a broken pipe warns once, not every flush. */
+  private warned = new Set<string>();
   
   private lastCpuUsage: NodeJS.CpuUsage;
   private lastCpuTime: number;
 
-  constructor(options: SentinelPluginOptions) {
+  constructor(options: SentrinelPluginOptions) {
     this.options = options;
     this.lastCpuUsage = process.cpuUsage();
     this.lastCpuTime = Date.now();
@@ -124,7 +127,12 @@ export class MetricsCollector {
     if (logs.length) this.appLogBuffer.push(...logs);
   }
 
-  /** Flush all buffered data to the Sentinel API */
+  /** Record a completed trace (root span + any spans the handler recorded) */
+  recordTrace(trace: any): void {
+    this.traceBuffer.push(trace);
+  }
+
+  /** Flush all buffered data to the Sentrinel API */
   async flush(): Promise<void> {
     if (this.isFlushing) return;
     this.isFlushing = true;
@@ -173,6 +181,21 @@ export class MetricsCollector {
           errors,
         };
         promises.push(this.sendToServer("/api/ingest/errors", payload));
+      }
+
+      // Traces post one at a time — /api/traces accepts a single trace, and a
+      // request rarely produces more than a handful per flush.
+      if (this.traceBuffer.length > 0) {
+        const traces = this.traceBuffer.splice(0, this.traceBuffer.length);
+        for (const trace of traces) {
+          promises.push(
+            this.sendToServer("/api/ingest/traces", {
+              appName: this.options.appName,
+              env: this.options.env || "dev",
+              ...trace,
+            })
+          );
+        }
       }
 
       await Promise.allSettled(promises);
@@ -236,6 +259,8 @@ export class MetricsCollector {
     return {
       appName: this.options.appName,
       env: this.options.env || "dev",
+      // Reported every flush; the server dedupes and only records changes.
+      version: this.options.version,
       timestamp: new Date().toISOString(),
       endpoints,
       consumers,
@@ -248,7 +273,7 @@ export class MetricsCollector {
     };
   }
 
-  /** Send payload to the Sentinel API server */
+  /** Send payload to the Sentrinel API server */
   private async sendToServer(path: string, payload: any): Promise<void> {
     const url = `${this.options.serverUrl}${path}`;
     try {
@@ -266,16 +291,48 @@ export class MetricsCollector {
       });
 
       if (!res.ok) {
-        this.log(`Failed to send to ${path}: ${res.status} ${res.statusText}`);
+        // A rejected batch means telemetry is being dropped. Staying quiet
+        // unless debug is on is how an app ends up sending nothing for days
+        // while looking perfectly healthy — so misconfiguration is always
+        // reported, once, with the server's own explanation.
+        const body = await res.text().catch(() => "");
+        const detail = body.slice(0, 300);
+        if (res.status === 401 || res.status === 403) {
+          this.warnOnce(
+            `${path}`,
+            `telemetry rejected (${res.status}). Check apiKey, appName and env — ` +
+              `the key must belong to this app and environment. Server said: ${detail}`
+          );
+        } else if (res.status === 429) {
+          this.warnOnce(`${path}`, `over quota (429) — telemetry is being dropped. ${detail}`);
+        } else {
+          this.warnOnce(`${path}`, `send failed: ${res.status} ${res.statusText}. ${detail}`);
+        }
+        return;
       }
+      // Recovered — allow the next failure to be reported again.
+      this.warned.delete(path);
     } catch (err) {
-      this.log(`Failed to connect to Sentinel server at ${url}:`, err);
+      this.warnOnce(
+        `connect:${path}`,
+        `cannot reach the Sentrinel server at ${url} — ${(err as Error)?.message ?? err}`
+      );
     }
+  }
+
+  /**
+   * Report a problem once per kind. A broken pipe flushes on every interval;
+   * logging each failure would bury the app's own output.
+   */
+  private warnOnce(key: string, message: string): void {
+    if (this.warned.has(key)) return;
+    this.warned.add(key);
+    console.warn(`[sentrinel] ${message}`);
   }
 
   private log(...args: any[]): void {
     if (this.options.debug) {
-      console.log("[sentinel]", ...args);
+      console.log("[sentrinel]", ...args);
     }
   }
 }
