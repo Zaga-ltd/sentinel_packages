@@ -1,2 +1,4 @@
 node_modules/
 *.log
+sentrinel_flutter/.dart_tool/
+sentrinel_flutter/pubspec.lock
