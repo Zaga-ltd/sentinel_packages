@@ -133,9 +133,28 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
       await collector.stop();
     });
 
-    app.derive(({ request }: any) => {
+    app.derive(async ({ request }: any) => {
       const requestLogId = crypto.randomUUID();
       if (options.logCapture?.enabled) beginRequestLogContext(requestLogId);
+
+      // Capture the request payload here, before the handler runs, and only
+      // when the caller opted into logging it. It is read from a *clone* of the
+      // request — an independent stream — so the original still reaches the
+      // handler untouched. This is the one safe place to see it: reading it
+      // from the context later (`ctx.body`, or any computed member access on
+      // the context) makes Elysia eagerly parse every request's payload, which
+      // consumes the single-use stream and breaks handlers that read the raw
+      // request themselves, such as an HMAC-verified webhook. See
+      // tests/raw-payload.test.ts.
+      let capturedPayload: string | undefined;
+      if (options.requestLogging?.logRequestBody) {
+        try {
+          capturedPayload = await request.clone().text();
+        } catch {
+          // A body that cannot be cloned/read is not worth failing the request
+          // over; telemetry is best-effort.
+        }
+      }
 
       // Open a trace context for this request.
       //
@@ -166,6 +185,7 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
         _sentrinelRequestLogId: requestLogId,
         _sentrinelTrace: traceCtx,
         _sentrinelTraceStart: new Date().toISOString(),
+        _sentrinelReqPayload: capturedPayload,
       };
     });
 
@@ -226,7 +246,24 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
         let consumerIdentifier: string | null | undefined = null;
         if (typeof options.consumerIdentifier === "function") {
           try {
-            consumerIdentifier = options.consumerIdentifier(ctx);
+            // Hand the resolver an explicit, field-by-field view rather than
+            // the raw context. Passing the whole context to a function Elysia
+            // cannot inspect makes it assume every field is needed — including
+            // the request payload — so it eagerly parses every request and
+            // consumes the single-use stream, breaking handlers that read the
+            // raw request themselves. Naming the fields keeps the payload out
+            // of what Elysia infers as used. A resolver that needs the parsed
+            // payload is the rare exception and can read it from `request`.
+            const safeCtx = {
+              request: ctx.request,
+              headers: ctx.headers,
+              set: ctx.set,
+              query: ctx.query,
+              params: ctx.params,
+              store: ctx.store,
+              response: ctx.response,
+            };
+            consumerIdentifier = options.consumerIdentifier(safeCtx);
           } catch {}
         } else if (typeof options.consumerIdentifier === "string") {
           // Header-name shorthand, matching the Express/Next adapters.
@@ -399,16 +436,19 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
               : queryObj;
           }
 
-          // Log request body (masked + truncated).
+          // Log the request payload (masked + truncated).
           //
-          // Read from ctx.body — the value Elysia already parsed — rather than
-          // request.clone().text(). By the time afterResponse runs the original
-          // stream is consumed, so the clone yields nothing and every POST body
-          // silently came through empty.
-          if (options.requestLogging.logRequestBody && ctx.body !== undefined && ctx.body !== null) {
+          // The payload was captured in the derive hook, from a clone of the
+          // request, before the handler ran — see there for why it must not be
+          // read from the context here. `_sentrinelReqPayload` is undefined
+          // unless logging it was enabled, so this whole block is inert
+          // otherwise.
+          const parsedPayload = (ctx as any)._sentrinelReqPayload as
+            | string
+            | undefined;
+          if (parsedPayload !== undefined && parsedPayload !== null) {
             try {
-              const raw =
-                typeof ctx.body === "string" ? ctx.body : JSON.stringify(ctx.body);
+              const raw = parsedPayload;
               if (raw && raw !== "{}") {
                 let maskedBody = options.requestLogging.maskBodyFields
                   ? maskBodyFields(raw, options.requestLogging.maskBodyFields)
@@ -419,7 +459,7 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
             } catch {}
           }
 
-          // Log response body (masked + truncated)
+          // Log the response payload (masked + truncated)
           if (options.requestLogging.logResponseBody && ctx.response !== null && ctx.response !== undefined) {
             try {
               let bodyText: string;

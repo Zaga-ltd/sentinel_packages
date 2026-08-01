@@ -22,12 +22,13 @@ describe("Multi-Framework Plugin Support", () => {
       headers: { "x-consumer-id": "web_react_client" },
     });
 
-    const ctx = await middleware(req);
-    expect(ctx.traceId).toMatch(/^[0-9a-f]{32}$/);
-    expect(ctx.headers.traceparent).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+    const res = await middleware(req);
+    expect(res.headers.get("traceparent")).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+    expect(res.headers.get("x-trace-id")).toMatch(/^[0-9a-f]{32}$/);
 
-    const res = new Response(JSON.stringify({ ok: true }), { status: 200 });
-    ctx.recordResponse(res);
+    // Record the response after handler completes
+    const handlerRes = new Response(JSON.stringify({ ok: true }), { status: 200 });
+    middleware.recordResponse(req, handlerRes);
   });
 
   it("sentrinelExpressMiddleware initializes express middleware function", () => {

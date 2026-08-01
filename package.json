@@ -1,7 +1,7 @@
 {
   "name": "@sentrinel/plugin",
-  "version": "0.1.0",
-  "description": "Sentrinel monitoring plugin for Elysia.js — exact metrics, sampled request logs, error tracking, console log capture, and resource usage, flushed to a self-hosted Sentrinel server.",
+  "version": "0.2.0",
+  "description": "Sentrinel monitoring plugin — exact metrics, request logs, error tracking, distributed tracing, and structured logging for Elysia, Express, Next.js, Bun, and Flutter.",
   "license": "MIT",
   "author": "Zaga Ltd",
   "repository": {
@@ -11,19 +11,26 @@
   "homepage": "https://github.com/Zaga-ltd/sentinel_packages#readme",
   "keywords": [
     "elysia",
+    "express",
+    "nextjs",
     "bun",
     "monitoring",
     "apm",
     "metrics",
     "observability",
-    "request-logging"
+    "request-logging",
+    "distributed-tracing",
+    "error-tracking"
   ],
   "type": "module",
   "main": "src/index.ts",
   "module": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./express": "./src/express.ts",
+    "./next": "./src/next.ts",
+    "./bun": "./src/bun.ts"
   },
   "files": [
     "src",
@@ -32,6 +39,11 @@
   ],
   "peerDependencies": {
     "elysia": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "elysia": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "elysia": "^1.2.0",
