@@ -1,7 +1,7 @@
 {
   "name": "@sentrinel/plugin",
   "version": "0.2.0",
-  "description": "Sentrinel monitoring plugin — exact metrics, request logs, error tracking, distributed tracing, and structured logging for Elysia, Express, Next.js, Bun, and Flutter.",
+  "description": "Sentrinel monitoring plugin \u2014 exact metrics, request logs, error tracking, distributed tracing, and structured logging for Elysia, Express, Next.js, Bun, and Flutter.",
   "license": "MIT",
   "author": "Zaga Ltd",
   "repository": {
@@ -30,7 +30,9 @@
     ".": "./src/index.ts",
     "./express": "./src/express.ts",
     "./next": "./src/next.ts",
-    "./bun": "./src/bun.ts"
+    "./bun": "./src/bun.ts",
+    "./browser": "./src/browser.ts",
+    "./tunnel": "./src/tunnel.ts"
   },
   "files": [
     "src",
