@@ -24,7 +24,13 @@ const rawApp = (plugin: Elysia) =>
     return { length: raw.length, raw };
   });
 
-const post = (app: Elysia) =>
+// Typed by what it uses, not as a bare `Elysia`.
+//
+// Registering a route widens Elysia's generics to carry that route, so the
+// value coming back from rawApp() is no longer assignable to the unparameterised
+// `Elysia` — tsc rejects it with a page of nested generic diff. All this helper
+// needs is `handle`.
+const post = (app: { handle: (request: Request) => Promise<Response> }) =>
   app.handle(
     new Request("http://localhost/raw", {
       method: "POST",

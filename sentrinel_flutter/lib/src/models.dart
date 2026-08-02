@@ -60,6 +60,62 @@ class RequestRecord {
       };
 }
 
+/// One app launch — the denominator for crash-free rate.
+///
+/// Reported twice: once when it starts, and once when it ends or is found
+/// abandoned by the next launch. The server upserts on `sessionId` and only
+/// ever lets the status get worse, so the order they arrive in does not matter.
+class SessionRecord {
+  SessionRecord({
+    required this.sessionId,
+    required this.status,
+    required this.startedAt,
+    this.release,
+    this.distinctId,
+    this.deviceOs,
+    this.deviceOsVersion,
+    this.durationMs,
+  });
+
+  final String sessionId;
+
+  /// `ok` · `crashed` · `abnormal` · `errored`.
+  ///
+  /// `abnormal` is the honest label for a session that vanished without a crash
+  /// report: force-quit, OOM kill, battery. Blaming a release for a user
+  /// swiping the app away would make crash-free rate meaningless.
+  final String status;
+
+  final DateTime startedAt;
+  final String? release;
+  final String? distinctId;
+  final String? deviceOs;
+  final String? deviceOsVersion;
+  final double? durationMs;
+
+  Map<String, dynamic> toJson() => {
+        'sessionId': sessionId,
+        'status': status,
+        'startedAt': startedAt.toUtc().toIso8601String(),
+        if (release != null) 'release': release,
+        if (distinctId != null) 'distinctId': distinctId,
+        if (deviceOs != null) 'deviceOs': deviceOs,
+        if (deviceOsVersion != null) 'deviceOsVersion': deviceOsVersion,
+        if (durationMs != null) 'durationMs': durationMs,
+      };
+
+  SessionRecord copyWith({String? status, double? durationMs}) => SessionRecord(
+        sessionId: sessionId,
+        status: status ?? this.status,
+        startedAt: startedAt,
+        release: release,
+        distinctId: distinctId,
+        deviceOs: deviceOs,
+        deviceOsVersion: deviceOsVersion,
+        durationMs: durationMs ?? this.durationMs,
+      );
+}
+
 /// A failure — a non-2xx response, a thrown exception, or a crash.
 class ErrorRecord {
   ErrorRecord({

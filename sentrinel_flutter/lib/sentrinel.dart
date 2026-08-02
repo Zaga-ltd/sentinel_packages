@@ -1,14 +1,24 @@
 /// Sentrinel for Flutter and Dart.
 ///
 /// ```dart
-/// void main() {
-///   Sentrinel.init(
-///     serverUrl: 'https://api.sentrinel.dev',
-///     appName: 'mobile-app',
-///     apiKey: const String.fromEnvironment('SENTRINEL_API_KEY'),
-///   );
-///   runApp(const MyApp());
-/// }
+/// void main() => Sentrinel.guard(() {
+///       Sentrinel.init(
+///         serverUrl: 'https://api.sentrinel.dev',
+///         appName: 'mobile-app',
+///         apiKey: const String.fromEnvironment('SENTRINEL_API_KEY'),
+///         storagePath: appSupportDir.path, // so crashes survive the crash
+///       );
+///
+///       // Flutter catches its own errors before any zone sees them.
+///       FlutterError.onError =
+///           (d) => Sentrinel.flutterErrorHandler(d.exception, d.stack);
+///       PlatformDispatcher.instance.onError = (e, s) {
+///         Sentrinel.platformErrorHandler(e, s);
+///         return true;
+///       };
+///
+///       runApp(const MyApp());
+///     });
 /// ```
 ///
 /// Then wrap your HTTP client and every call is recorded:
@@ -24,14 +34,19 @@
 library;
 
 import 'dart:async';
+import 'dart:io';
+import 'dart:isolate';
 
 import 'package:http/http.dart' as http;
 
 import 'src/collector.dart';
+import 'src/context.dart';
 import 'src/models.dart';
+import 'src/spool.dart';
 import 'src/trace.dart';
 
-export 'src/models.dart' show RequestRecord, ErrorRecord, LogRecord;
+export 'src/context.dart' show Breadcrumb;
+export 'src/models.dart' show RequestRecord, ErrorRecord, LogRecord, SessionRecord;
 export 'src/trace.dart' show TraceContext, generateTraceId, generateSpanId;
 
 /// The entry point. One instance per app.
@@ -41,10 +56,24 @@ class Sentrinel {
   static SentrinelCollector? _collector;
   static String? _consumer;
   static Map<String, Object?> _context = {};
+  static CrashSpool? _spool;
+  static final BreadcrumbTrail _crumbs = BreadcrumbTrail();
+  static Map<String, Object?> _device = const {};
+  static RawReceivePort? _isolateErrors;
+  static String? _sessionId;
+  static DateTime? _sessionStartedAt;
+  static String? _release;
 
   /// True once [init] has been called. Every other call is a no-op until then,
   /// so a missing init degrades to "no telemetry" rather than a crash.
   static bool get isInitialised => _collector != null;
+
+  /// Set when the previous run of the app ended without a clean shutdown.
+  ///
+  /// Read it to show "we noticed last time did not go well" — and note it is
+  /// the honest definition: killed by the OS, force-quit and hard crash all
+  /// look identical from inside the next launch.
+  static bool previousRunCrashed = false;
 
   static void init({
     required String serverUrl,
@@ -56,9 +85,32 @@ class Sentrinel {
     /// channel. Whatever you want to slice traffic by.
     String? consumerIdentifier,
     http.Client? httpClient,
+
+    /// Where crash reports wait between the crash and the next launch.
+    ///
+    /// On Flutter pass `(await getApplicationSupportDirectory()).path`. Left
+    /// null it falls back to the system temp directory, which works but is
+    /// fair game for the OS to clear — fine for development, not for shipping.
+    /// Set it to null explicitly, via [persistCrashes], to keep everything in
+    /// memory.
+    String? storagePath,
+
+    /// The build this is — a version name, a git SHA, whatever you ship with.
+    /// Crash-free rate is per release; without it every build is "unknown" and
+    /// you cannot tell a regression from the status quo.
+    String? release,
+
+    /// Write fatal errors to disk so they survive the process. Turning this off
+    /// means crashes are only reported if the app happens to live long enough
+    /// for the next flush, which for a real crash it does not.
+    bool persistCrashes = true,
   }) {
     _collector?.dispose();
     _consumer = consumerIdentifier;
+    _device = deviceContext();
+    _release = release;
+    _crumbs.clear();
+
     _collector = SentrinelCollector(
       serverUrl: serverUrl,
       appName: appName,
@@ -67,6 +119,136 @@ class Sentrinel {
       flushInterval: flushInterval,
       client: httpClient,
     )..start();
+
+    if (persistCrashes) {
+      _spool = CrashSpool(storagePath ?? '${Directory.systemTemp.path}/sentrinel');
+      _openSession(appName, env);
+      _deliverPending();
+    } else {
+      _spool = null;
+    }
+
+    _listenForIsolateErrors();
+  }
+
+  /// Record that this run started, and notice if the last one never finished.
+  static void _openSession(String appName, String env) {
+    _sessionId = generateTraceId();
+    _sessionStartedAt = DateTime.now();
+    final previous = _spool!.beginSession({
+      'sessionId': _sessionId,
+      'startedAt': _sessionStartedAt!.toUtc().toIso8601String(),
+      'appName': appName,
+      'env': env,
+      if (_release != null) 'release': _release,
+      // Flipped the moment a fatal error is written, so the next launch can
+      // tell a crash from a force-quit.
+      'crashed': false,
+    });
+
+    // This session, reported as running. Crash-free rate needs the denominator
+    // as much as the numerator — a launch that never fails still has to be
+    // counted, or the rate is computed only over the crashes.
+    _collector?.recordSession(SessionRecord(
+      sessionId: _sessionId!,
+      status: 'ok',
+      startedAt: _sessionStartedAt!,
+      release: _release,
+      distinctId: _consumer,
+      deviceOs: _device['device.os'] as String?,
+      deviceOsVersion: _device['device.os_version'] as String?,
+    ));
+
+    previousRunCrashed = previous != null;
+    if (previous == null) return;
+
+    // The previous session left its marker behind, so it did not shut down
+    // cleanly. Whether a crash report also arrived decides which it was: with
+    // one it is `crashed` and belongs to the release; without, it is `abnormal`
+    // — force-quit, OOM kill, battery — and counting that against the release
+    // would make the metric dishonest.
+    final crashed = previous['crashed'] == true;
+    _collector?.recordSession(SessionRecord(
+      sessionId: (previous['sessionId'] as String?) ?? generateTraceId(),
+      status: crashed ? 'crashed' : 'abnormal',
+      startedAt: DateTime.tryParse('${previous['startedAt']}')?.toLocal() ?? DateTime.now(),
+      release: previous['release'] as String?,
+      distinctId: _consumer,
+      deviceOs: _device['device.os'] as String?,
+      deviceOsVersion: _device['device.os_version'] as String?,
+    ));
+  }
+
+  /// Send anything an earlier run queued to disk before it died.
+  static void _deliverPending() {
+    final pending = _spool!.drain();
+    if (pending.isEmpty) return;
+    final collector = _collector;
+    if (collector == null) return;
+
+    for (final record in pending) {
+      // Replayed as-is: these were serialised at crash time and their
+      // timestamps are from then, not now.
+      collector.recordRaw(record.kind, record.json);
+    }
+  }
+
+  /// Errors thrown on other isolates never reach a zone handler on this one.
+  static void _listenForIsolateErrors() {
+    _isolateErrors?.close();
+    try {
+      final port = RawReceivePort((dynamic pair) {
+        // Isolate errors arrive as [errorString, stackString].
+        if (pair is List && pair.length >= 2) {
+          captureError(
+            pair[0]?.toString() ?? 'Isolate error',
+            pair[1] == null ? null : StackTrace.fromString(pair[1].toString()),
+            fatal: true,
+            mechanism: 'Isolate.onError',
+          );
+        }
+      });
+      Isolate.current.addErrorListener(port.sendPort);
+      _isolateErrors = port;
+    } catch (_) {
+      // Not supported on every platform; nothing else depends on it.
+    }
+  }
+
+  /// Run the app with uncaught errors reported automatically.
+  ///
+  /// ```dart
+  /// void main() => Sentrinel.guard(() {
+  ///       Sentrinel.init(serverUrl: '…', appName: 'mobile-app');
+  ///       runApp(const MyApp());
+  ///     });
+  /// ```
+  ///
+  /// This catches everything that escapes to the zone. Flutter intercepts
+  /// framework errors before they get that far, so under Flutter also wire the
+  /// two handlers in [flutterErrorHandler] — those live in `dart:ui` and
+  /// `package:flutter`, which this package deliberately does not depend on.
+  static R? guard<R>(R Function() body) {
+    return runZonedGuarded<R>(body, (error, stack) {
+      captureError(error, stack, fatal: true, mechanism: 'runZonedGuarded');
+    });
+  }
+
+  /// Leave a marker describing something the app just did.
+  ///
+  /// Attached to every error reported afterwards. Navigation, taps, and the
+  /// requests made by [SentrinelHttpClient] are the ones worth recording.
+  static void addBreadcrumb(
+    String message, {
+    String category = 'app',
+    Map<String, Object?>? data,
+  }) {
+    _crumbs.add(Breadcrumb(
+      timestamp: DateTime.now(),
+      category: category,
+      message: message,
+      data: data,
+    ));
   }
 
   /// Fields attached to every subsequent record — screen, user tier, build.
@@ -84,27 +266,89 @@ class Sentrinel {
   static http.Client httpClient({http.Client? inner}) =>
       SentrinelHttpClient(inner ?? http.Client());
 
-  /// Report a caught error, or a crash from your zone handler.
+  /// Report an error.
+  ///
+  /// [fatal] is what separates a caught exception from a crash. A fatal error
+  /// is written to disk **synchronously, before this returns**, because the
+  /// process is about to stop existing and the next flush is thirty seconds
+  /// away. Non-fatal errors take the ordinary buffered path.
+  ///
+  /// [mechanism] records how the error was caught — `runZonedGuarded`,
+  /// `FlutterError.onError`, `Isolate.onError`, or your own call. When the same
+  /// exception arrives through two handlers, this is what tells them apart.
   static void captureError(
     Object error,
     StackTrace? stack, {
     String? path,
     Map<String, Object?>? attributes,
+    bool fatal = false,
+    String? mechanism,
   }) {
     final collector = _collector;
     if (collector == null) return;
-    collector.recordError(ErrorRecord(
+
+    final record = ErrorRecord(
       method: 'APP',
-      path: path ?? 'app',
+      path: path ?? (fatal ? 'app/crash' : 'app'),
       statusCode: 500,
       timestamp: DateTime.now(),
       errorType: error.runtimeType.toString(),
       errorMessage: error.toString(),
       stackTrace: stack?.toString(),
       consumerIdentifier: _consumer,
-      attributes: {..._context, ...?attributes},
-    ));
+      attributes: {
+        ..._device,
+        ..._context,
+        ...?attributes,
+        if (mechanism != null) 'sentrinel.mechanism': mechanism,
+        if (fatal) 'sentrinel.fatal': true,
+        if (_sessionId != null) 'session.id': _sessionId,
+        if (_crumbs.length > 0) 'breadcrumbs': _crumbs.toJson(),
+      },
+    );
+
+    final spool = _spool;
+    if (fatal && spool != null) {
+      // On disk first. If the app dies on the next line the report still ships
+      // on the next launch; the buffered copy below is just the fast path for
+      // the case where it survives.
+      spool.appendSync('error', record.toJson());
+      // And mark the session, so the next launch reports `crashed` rather than
+      // the vaguer `abnormal`.
+      spool.markSessionCrashed();
+      return;
+    }
+    collector.recordError(record);
   }
+
+  /// Hand a Flutter framework error to Sentrinel.
+  ///
+  /// Flutter catches errors inside its own build/layout/paint phases before any
+  /// zone sees them, so [guard] alone does not cover them. Wiring is two lines,
+  /// and stays in your app because the types live in `package:flutter` and
+  /// `dart:ui` — dependencies this package does not take, so that it keeps
+  /// working in plain Dart:
+  ///
+  /// ```dart
+  /// FlutterError.onError = (details) =>
+  ///     Sentrinel.flutterErrorHandler(details.exception, details.stack);
+  ///
+  /// PlatformDispatcher.instance.onError = (error, stack) {
+  ///   Sentrinel.platformErrorHandler(error, stack);
+  ///   return true;
+  /// };
+  /// ```
+  static void flutterErrorHandler(Object error, StackTrace? stack) =>
+      captureError(error, stack, fatal: true, mechanism: 'FlutterError.onError');
+
+  /// The companion for errors that escape to the engine — see
+  /// [flutterErrorHandler].
+  static void platformErrorHandler(Object error, StackTrace? stack) => captureError(
+        error,
+        stack,
+        fatal: true,
+        mechanism: 'PlatformDispatcher.onError',
+      );
 
   static void log(
     String level,
@@ -136,10 +380,39 @@ class Sentrinel {
   /// — a backgrounded app may not get another timer tick.
   static Future<void> flush() async => _collector?.flush();
 
+  /// Shut down cleanly.
+  ///
+  /// Clearing the session marker is what makes crash detection mean anything:
+  /// without it every ordinary exit would look, on the next launch, exactly
+  /// like a crash.
   static Future<void> close() async {
+    // Recorded *before* stop(), because stop() performs the final flush. Queued
+    // after it, the closing session would sit in a buffer belonging to a
+    // collector that is never going to send anything again.
+    if (_sessionId != null && _sessionStartedAt != null) {
+      _collector?.recordSession(SessionRecord(
+        sessionId: _sessionId!,
+        status: 'ok',
+        startedAt: _sessionStartedAt!,
+        release: _release,
+        distinctId: _consumer,
+        deviceOs: _device['device.os'] as String?,
+        deviceOsVersion: _device['device.os_version'] as String?,
+        durationMs:
+            DateTime.now().difference(_sessionStartedAt!).inMilliseconds.toDouble(),
+      ));
+    }
+
     await _collector?.stop();
     _collector?.dispose();
     _collector = null;
+    _isolateErrors?.close();
+    _isolateErrors = null;
+    _spool?.endSession();
+    _spool = null;
+    _sessionId = null;
+    _sessionStartedAt = null;
+    _crumbs.clear();
   }
 
   // ── internals used by the client wrapper ──
@@ -186,6 +459,17 @@ class SentrinelHttpClient extends http.BaseClient {
         attributes: Sentrinel.context.isEmpty ? null : {...Sentrinel.context},
       ));
 
+      // Left automatically, because a breadcrumb trail you have to remember to
+      // fill is empty in exactly the app that just crashed.
+      Sentrinel.addBreadcrumb(
+        '${request.method} ${request.url.path.isEmpty ? '/' : request.url.path}',
+        category: 'http',
+        data: {
+          'status': response.statusCode,
+          'ms': (watch.elapsedMicroseconds / 1000).round(),
+        },
+      );
+
       if (response.statusCode >= 400) {
         collector.recordError(ErrorRecord(
           method: request.method,
@@ -215,6 +499,11 @@ class SentrinelHttpClient extends http.BaseClient {
         errorMessage: err.toString(),
         traceId: trace.traceId,
       ));
+      Sentrinel.addBreadcrumb(
+        '${request.method} ${request.url.path.isEmpty ? '/' : request.url.path} failed',
+        category: 'http',
+        data: {'error': err.runtimeType.toString()},
+      );
       collector.recordError(ErrorRecord(
         method: request.method,
         path: request.url.path.isEmpty ? '/' : request.url.path,

@@ -1,0 +1,32 @@
+name: sentrinel_flutter
+description: >-
+  Flutter integration for Sentrinel. Wires framework and engine error handlers,
+  measures app start and slow/frozen frames, records navigation breadcrumbs, and
+  stores crash reports where they survive a restart.
+version: 0.1.0
+repository: https://github.com/Zaga-ltd/sentinel_packages
+homepage: https://sentrinel.dev
+
+# Distributed by git, like the rest of the SDKs — `bun add` and `flutter pub add`
+# both take a GitHub ref. Declaring that here is what lets the core be a path
+# dependency: within one repository that is exactly right, and pub.dev's
+# no-path-dependencies rule does not apply to a package that never goes there.
+publish_to: none
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+  flutter: ">=3.10.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # The pure-Dart core. It stays free of any Flutter dependency so it can also
+  # be used from CLIs and server code; everything that needs the framework
+  # lives here instead.
+  sentrinel:
+    path: ../sentrinel_flutter
+  path_provider: ^2.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter

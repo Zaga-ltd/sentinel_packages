@@ -74,6 +74,32 @@ class SentrinelCollector {
     _push(_logs, record, kMaxBufferedLogs);
   }
 
+  /// Sessions are keyed, not appended: a session reported at start and again at
+  /// end must send one row, not two. The server upserts, but sending both from
+  /// the same flush would be pure waste.
+  final Map<String, SessionRecord> _sessions = {};
+
+  void recordSession(SessionRecord record) {
+    _sessions[record.sessionId] = record;
+  }
+
+  /// Records replayed from disk after a crash.
+  ///
+  /// Already-serialised JSON, kept verbatim: these were written at crash time
+  /// and their timestamps belong to then, not to this launch. Re-building them
+  /// into model objects would only risk changing them.
+  final Map<String, List<Map<String, dynamic>>> _replayed = {};
+
+  void recordRaw(String kind, Map<String, dynamic> json) {
+    final bucket = _replayed.putIfAbsent(kind, () => []);
+    if (bucket.length >= kMaxBufferedErrors) {
+      bucket.removeAt(0);
+      droppedRecords++;
+      return;
+    }
+    bucket.add(json);
+  }
+
   void _push<T>(List<T> buffer, T item, int max) {
     if (buffer.length >= max) {
       // Drop the oldest: the newest records are the ones a developer opening
@@ -85,7 +111,12 @@ class SentrinelCollector {
   }
 
   /// Number of records waiting to be sent. Exposed for tests and diagnostics.
-  int get pending => _requests.length + _errors.length + _logs.length;
+  int get pending =>
+      _requests.length +
+      _errors.length +
+      _logs.length +
+      _sessions.length +
+      _replayed.values.fold(0, (n, list) => n + list.length);
 
   Future<void> flush() async {
     if (pending == 0) return;
@@ -94,30 +125,58 @@ class SentrinelCollector {
     final requests = List<RequestRecord>.from(_requests);
     final errors = List<ErrorRecord>.from(_errors);
     final logs = List<LogRecord>.from(_logs);
+    final replayed = {
+      for (final e in _replayed.entries) e.key: List<Map<String, dynamic>>.from(e.value)
+    };
+    final sessions = List<SessionRecord>.from(_sessions.values);
     _requests.clear();
     _errors.clear();
     _logs.clear();
+    _sessions.clear();
+    _replayed.clear();
 
+    // Crash reports from a previous run travel with this run's records, on the
+    // same endpoints — the server cannot tell the difference and should not.
+    final endpoints = {'request': 'requests', 'error': 'errors', 'log': 'logs'};
     final sends = <Future<void>>[];
-    if (requests.isNotEmpty) {
-      sends.add(_post('/api/ingest/requests', {
+
+    List<Map<String, dynamic>> combined(String kind, List<Map<String, dynamic>> live) =>
+        [...?replayed[kind], ...live];
+
+    final allRequests = combined('request', requests.map((r) => r.toJson()).toList());
+    final allErrors = combined('error', errors.map((e) => e.toJson()).toList());
+    final allLogs = combined('log', logs.map((l) => l.toJson()).toList());
+
+    if (allRequests.isNotEmpty) {
+      sends.add(_post('/api/ingest/${endpoints['request']}', {
         'appName': appName,
         'env': env,
-        'requests': requests.map((r) => r.toJson()).toList(),
+        'requests': allRequests,
       }));
     }
-    if (errors.isNotEmpty) {
-      sends.add(_post('/api/ingest/errors', {
+    if (allErrors.isNotEmpty) {
+      sends.add(_post('/api/ingest/${endpoints['error']}', {
         'appName': appName,
         'env': env,
-        'errors': errors.map((e) => e.toJson()).toList(),
+        'errors': allErrors,
       }));
     }
-    if (logs.isNotEmpty) {
-      sends.add(_post('/api/ingest/logs', {
+    if (allLogs.isNotEmpty) {
+      sends.add(_post('/api/ingest/${endpoints['log']}', {
         'appName': appName,
         'env': env,
-        'logs': logs.map((l) => l.toJson()).toList(),
+        'logs': allLogs,
+      }));
+    }
+    final allSessions = [
+      ...?replayed['session'],
+      ...sessions.map((s) => s.toJson()),
+    ];
+    if (allSessions.isNotEmpty) {
+      sends.add(_post('/api/ingest/sessions', {
+        'appName': appName,
+        'env': env,
+        'sessions': allSessions,
       }));
     }
     await Future.wait(sends);
