@@ -32,6 +32,14 @@ import 'package:sentrinel/sentrinel.dart';
 
 import 'src/frames.dart';
 
+// The core, re-exported.
+//
+// Splitting into two packages is an implementation detail of *our* build, not
+// something a Flutter app should have to know about: importing this and then
+// finding `Sentrinel`, `TraceContext` and the record types undefined is a
+// papercut with no upside. One import gets everything.
+export 'package:sentrinel/sentrinel.dart';
+
 export 'src/frames.dart' show FrameTracker, kFrozenFrameMs, kDefaultFrameBudgetMs;
 export 'src/navigation.dart' show SentrinelNavigatorObserver;
 
