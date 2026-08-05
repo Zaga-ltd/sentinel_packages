@@ -133,28 +133,38 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
       await collector.stop();
     });
 
-    app.derive(async ({ request }: any) => {
-      const requestLogId = crypto.randomUUID();
-      if (options.logCapture?.enabled) beginRequestLogContext(requestLogId);
-
-      // Capture the request payload here, before the handler runs, and only
-      // when the caller opted into logging it. It is read from a *clone* of the
-      // request — an independent stream — so the original still reaches the
-      // handler untouched. This is the one safe place to see it: reading it
-      // from the context later (`ctx.body`, or any computed member access on
-      // the context) makes Elysia eagerly parse every request's payload, which
-      // consumes the single-use stream and breaks handlers that read the raw
-      // request themselves, such as an HMAC-verified webhook. See
-      // tests/raw-payload.test.ts.
-      let capturedPayload: string | undefined;
-      if (options.requestLogging?.logRequestBody) {
+    // Request payloads, captured before anything else can consume the stream.
+    //
+    // This has to happen in `onRequest`, not `derive`. `derive` runs at the
+    // transform stage — *after* Elysia has parsed the body — and once it has,
+    // cloning yields an already-drained stream that reads back as "" with no
+    // error thrown. Elysia parses eagerly for any route that declares a `body`
+    // schema, which in a typed app is nearly every POST/PUT/PATCH, so the
+    // payload silently went missing on exactly the requests most worth having
+    // it for. See tests/raw-payload.test.ts.
+    //
+    // Reading from a *clone* keeps the original stream untouched for the
+    // handler, so a route that verifies a raw signature still sees its bytes.
+    // Keyed by the Request itself, weakly, so nothing is retained after the
+    // response is done.
+    const capturedPayloads = new WeakMap<Request, string>();
+    if (options.requestLogging?.logRequestBody) {
+      app.onRequest(async ({ request }: any) => {
         try {
-          capturedPayload = await request.clone().text();
+          const text = await request.clone().text();
+          if (text) capturedPayloads.set(request, text);
         } catch {
           // A body that cannot be cloned/read is not worth failing the request
           // over; telemetry is best-effort.
         }
-      }
+      });
+    }
+
+    app.derive(async ({ request }: any) => {
+      const requestLogId = crypto.randomUUID();
+      if (options.logCapture?.enabled) beginRequestLogContext(requestLogId);
+
+      const capturedPayload = capturedPayloads.get(request);
 
       // Open a trace context for this request.
       //
@@ -398,7 +408,11 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
           const entry: RequestLogEntry = {
             id: requestLogId,
             method,
+            // The row keeps the real URL; `route` is what anything grouping
+            // should key on. Sending only `pathname` made the API register one
+            // endpoint per id.
             path: pathname,
+            route: routePath,
             statusCode,
             responseTime: Math.round(responseTime * 100) / 100,
             requestSize,

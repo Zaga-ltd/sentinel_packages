@@ -6,28 +6,12 @@
 /// app did" usually tells you why.
 library;
 
-import 'dart:io';
-
-/// What can be learned about the device without a plugin.
-///
-/// Deliberately `dart:io` only. Model name and manufacturer would need
-/// device_info_plus, which is a Flutter plugin — taking that dependency would
-/// stop this package working in plain Dart, where it is used for CLIs and
-/// server-side jobs. These fields are the ones available everywhere.
-Map<String, Object?> deviceContext() {
-  try {
-    return {
-      'device.os': Platform.operatingSystem,
-      'device.os_version': Platform.operatingSystemVersion,
-      'device.locale': Platform.localeName,
-      'device.cores': Platform.numberOfProcessors,
-      'runtime.dart': Platform.version.split(' ').first,
-    };
-  } catch (_) {
-    // Platform throws on the web, where none of this exists.
-    return const {};
-  }
-}
+// Device facts moved to `device.dart`, which answers per platform instead of
+// calling `Platform` everywhere and catching the `UnsupportedError` the web
+// throws back. The catch worked — this file was never the thing broken on web —
+// but it made "no device context" indistinguishable from "the lookup failed",
+// and it kept a `dart:io` import in a file whose remaining contents need
+// nothing of the sort. Everything below is plain Dart and runs anywhere.
 
 /// One thing the app did, kept to explain what led to a failure.
 class Breadcrumb {

@@ -34,13 +34,18 @@
 library;
 
 import 'dart:async';
-import 'dart:io';
-import 'dart:isolate';
 
 import 'package:http/http.dart' as http;
 
 import 'src/collector.dart';
 import 'src/context.dart';
+// `dart:io` and `dart:isolate` compile on web and then throw the moment they
+// are used, so the failure surfaced here — `Directory.systemTemp` inside
+// init — as `Unsupported operation: _Namespace`, with nothing in the message to
+// suggest a filesystem. These resolve the platform at import time instead, so
+// a browser build never reaches either library.
+import 'src/device.dart';
+import 'src/isolate_hook.dart';
 import 'src/models.dart';
 import 'src/spool.dart';
 import 'src/trace.dart';
@@ -59,7 +64,7 @@ class Sentrinel {
   static CrashSpool? _spool;
   static final BreadcrumbTrail _crumbs = BreadcrumbTrail();
   static Map<String, Object?> _device = const {};
-  static RawReceivePort? _isolateErrors;
+  static IsolateErrorSubscription? _isolateErrors;
   static String? _sessionId;
   static DateTime? _sessionStartedAt;
   static String? _release;
@@ -121,7 +126,7 @@ class Sentrinel {
     )..start();
 
     if (persistCrashes) {
-      _spool = CrashSpool(storagePath ?? '${Directory.systemTemp.path}/sentrinel');
+      _spool = CrashSpool(storagePath ?? defaultStoragePath());
       _openSession(appName, env);
       _deliverPending();
     } else {
@@ -194,25 +199,14 @@ class Sentrinel {
   }
 
   /// Errors thrown on other isolates never reach a zone handler on this one.
+  ///
+  /// Returns without installing anything on web, which has no isolate error
+  /// channel — see `isolate_hook_web.dart`.
   static void _listenForIsolateErrors() {
     _isolateErrors?.close();
-    try {
-      final port = RawReceivePort((dynamic pair) {
-        // Isolate errors arrive as [errorString, stackString].
-        if (pair is List && pair.length >= 2) {
-          captureError(
-            pair[0]?.toString() ?? 'Isolate error',
-            pair[1] == null ? null : StackTrace.fromString(pair[1].toString()),
-            fatal: true,
-            mechanism: 'Isolate.onError',
-          );
-        }
-      });
-      Isolate.current.addErrorListener(port.sendPort);
-      _isolateErrors = port;
-    } catch (_) {
-      // Not supported on every platform; nothing else depends on it.
-    }
+    _isolateErrors = listenForIsolateErrors((error, stack) {
+      captureError(error, stack, fatal: true, mechanism: 'Isolate.onError');
+    });
   }
 
   /// Run the app with uncaught errors reported automatically.

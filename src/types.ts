@@ -129,7 +129,17 @@ export interface RequestLogEntry {
   /** Client-generated id so app logs can reference the request. */
   id?: string;
   method: string;
+  /** The URL as requested, ids and all — what you want to read on the row. */
   path: string;
+  /**
+   * The matched route pattern (`/orders/:id`), when the framework exposes one.
+   *
+   * `path` cannot serve both purposes: grouping by it makes one endpoint per
+   * distinct id, which is an unbounded row count in the endpoints table and an
+   * "active endpoints" figure in the hundreds for an app with thirty routes.
+   * Consumers that group should prefer this and fall back to `path`.
+   */
+  route?: string;
   statusCode: number;
   responseTime: number;
   requestSize: number;
