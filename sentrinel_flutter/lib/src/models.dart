@@ -201,3 +201,57 @@ class LogRecord {
         if (spanId != null) 'spanId': spanId,
       };
 }
+
+/// One span of work, for the trace waterfall.
+///
+/// The app sends `traceparent` on every request, so the backend already
+/// continues the same trace. What was missing is this: the client's own span.
+/// Without it the waterfall starts at the server, and the time between the tap
+/// and the first byte the server saw — DNS, TLS, the radio, a cold connection —
+/// is invisible, which is usually the part being argued about.
+class SpanRecord {
+  SpanRecord({
+    required this.id,
+    required this.traceId,
+    required this.name,
+    required this.startTime,
+    required this.durationMs,
+    this.parentId,
+    this.kind = 'CLIENT',
+    this.statusCode = 'OK',
+    this.attributes,
+  });
+
+  final String id;
+  final String traceId;
+  final String? parentId;
+  final String name;
+  final String kind;
+  final DateTime startTime;
+  final double durationMs;
+  final String statusCode;
+  final Map<String, Object?>? attributes;
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'traceId': traceId,
+        'parentId': parentId,
+        'name': name,
+        'kind': kind,
+        'startTime': startTime.toUtc().toIso8601String(),
+        'endTime': startTime
+            .add(Duration(microseconds: (durationMs * 1000).round()))
+            .toUtc()
+            .toIso8601String(),
+        'durationMs': durationMs,
+        'statusCode': statusCode,
+        // `sentrinel.source` is what lets the waterfall say which tier a span
+        // ran on. Set here rather than inferred from `kind`: a CLIENT span is
+        // emitted by a phone, a browser and a backend calling another service
+        // alike, and those are three different answers.
+        'attributes': {
+          'sentrinel.source': 'mobile',
+          ...?attributes,
+        },
+      };
+}

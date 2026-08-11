@@ -277,4 +277,154 @@ void main() {
       collector.dispose();
     });
   });
+
+  // The dashboard reads two different things from one flush: the request rows
+  // feed the log view, and a per-endpoint rollup feeds every headline number —
+  // request count, error rate, p95, and the Traffic and Performance charts.
+  //
+  // Sending only the rows is not a partial integration, it is an invisible
+  // one: a Flutter app that was reporting correctly showed "0 requests, 0.0 %,
+  // 0 ms" on the Apps page, which is precisely the screen someone opens to
+  // check whether the SDK works at all. Nothing failed and nothing warned.
+  group('the endpoint rollup', () {
+    Future<Captured> flushRequests(List<RequestRecord> records) async {
+      final captured = Captured();
+      final collector = SentrinelCollector(
+        serverUrl: 'https://api.test',
+        appName: 'a',
+        env: 'test',
+        apiKey: 'k',
+        client: captured.client(),
+      );
+      for (final r in records) {
+        collector.recordRequest(r);
+      }
+      await collector.flush();
+      collector.dispose();
+      return captured;
+    }
+
+    RequestRecord req({
+      String method = 'GET',
+      String path = '/api/v1/jobs',
+      int statusCode = 200,
+      double responseTime = 100,
+      String? consumer,
+    }) =>
+        RequestRecord(
+          id: 'r${DateTime.now().microsecondsSinceEpoch}$responseTime$statusCode',
+          method: method,
+          path: path,
+          statusCode: statusCode,
+          responseTime: responseTime,
+          timestamp: DateTime.now(),
+          consumerIdentifier: consumer,
+        );
+
+    test('a flush that sends requests also sends metrics', () async {
+      final captured = await flushRequests([req()]);
+      expect(captured.byPath['/api/ingest/requests'], isNotNull);
+      expect(
+        captured.byPath['/api/ingest/metrics'],
+        isNotNull,
+        reason: 'without this the Apps page reads zero for a working app',
+      );
+    });
+
+    test('requests are grouped by method and path', () async {
+      final captured = await flushRequests([
+        req(path: '/api/v1/jobs'),
+        req(path: '/api/v1/jobs'),
+        req(path: '/api/v1/parts'),
+        req(method: 'POST', path: '/api/v1/jobs'),
+      ]);
+
+      final endpoints = captured.rows('/api/ingest/metrics', 'endpoints');
+      expect(endpoints.length, 3);
+
+      final getJobs = endpoints.firstWhere(
+        (e) => e['method'] == 'GET' && e['path'] == '/api/v1/jobs',
+      );
+      expect(getJobs['requestCount'], 2);
+    });
+
+    test('errors are counted separately, and status codes are kept', () async {
+      final captured = await flushRequests([
+        req(statusCode: 200),
+        req(statusCode: 200),
+        req(statusCode: 404),
+        req(statusCode: 500),
+      ]);
+
+      final endpoint = captured.rows('/api/ingest/metrics', 'endpoints').single;
+      expect(endpoint['requestCount'], 4);
+      expect(endpoint['successCount'], 2);
+      // 4xx counts as an error here because the dashboard's error rate is
+      // "requests that did not succeed", not "requests the server broke on".
+      expect(endpoint['errorCount'], 2);
+      expect(endpoint['statusCodes'], {'200': 2, '404': 1, '500': 1});
+    });
+
+    test('percentiles interpolate the way the server plugin does', () async {
+      // 1..100ms. p95 over a sorted list of 100 with linear interpolation sits
+      // at index 94.05 — between 95 and 96 — not at a round bucket. Matching
+      // the server's method is the point: a p95 that means one thing on mobile
+      // and another on the backend is worse than no p95.
+      final captured = await flushRequests([
+        for (var ms = 1; ms <= 100; ms++) req(responseTime: ms.toDouble()),
+      ]);
+
+      final endpoint = captured.rows('/api/ingest/metrics', 'endpoints').single;
+      expect(endpoint['minResponseTime'], 1);
+      expect(endpoint['maxResponseTime'], 100);
+      expect(endpoint['avgResponseTime'], closeTo(50.5, 0.01));
+      expect(endpoint['p50ResponseTime'], closeTo(50.5, 0.01));
+      expect(endpoint['p95ResponseTime'], closeTo(95.05, 0.01));
+      expect(endpoint['p99ResponseTime'], closeTo(99.01, 0.01));
+    });
+
+    test('consumers are rolled up per endpoint', () async {
+      final captured = await flushRequests([
+        req(consumer: 'tech-01'),
+        req(consumer: 'tech-01', statusCode: 500),
+        req(consumer: 'tech-02'),
+      ]);
+
+      final consumers = captured.rows('/api/ingest/metrics', 'consumers');
+      expect(consumers.length, 2);
+
+      final one = consumers.firstWhere((c) => c['identifier'] == 'tech-01');
+      expect(one['requestCount'], 2);
+      expect(one['errorCount'], 1);
+    });
+
+    test('a request with no consumer does not invent one', () async {
+      // Bucketing these under "anonymous" would put a row in the Consumers
+      // table that nobody can contact, filter by, or act on.
+      final captured = await flushRequests([req(), req(consumer: 'tech-01')]);
+
+      final consumers = captured.rows('/api/ingest/metrics', 'consumers');
+      expect(consumers.length, 1);
+      expect(consumers.single['identifier'], 'tech-01');
+    });
+
+    test('a flush with no requests sends no metrics', () async {
+      final captured = Captured();
+      final collector = SentrinelCollector(
+        serverUrl: 'https://api.test',
+        appName: 'a',
+        env: 'test',
+        apiKey: 'k',
+        client: captured.client(),
+      );
+      collector.recordLog(
+        LogRecord(level: 'info', message: 'no traffic', timestamp: DateTime.now()),
+      );
+      await collector.flush();
+      collector.dispose();
+
+      expect(captured.byPath['/api/ingest/logs'], isNotNull);
+      expect(captured.byPath['/api/ingest/metrics'], isNull);
+    });
+  });
 }

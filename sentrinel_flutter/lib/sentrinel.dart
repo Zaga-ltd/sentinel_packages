@@ -51,7 +51,11 @@ import 'src/spool.dart';
 import 'src/trace.dart';
 
 export 'src/context.dart' show Breadcrumb;
-export 'src/models.dart' show RequestRecord, ErrorRecord, LogRecord, SessionRecord;
+/// Pass to `Isolate.spawn(onError:)` — see the getter's own docs for why a
+/// worker spawned without it reports nothing.
+export 'src/isolate_hook.dart' show isolateErrorPort;
+export 'src/models.dart'
+    show RequestRecord, ErrorRecord, LogRecord, SessionRecord, SpanRecord;
 export 'src/trace.dart' show TraceContext, generateTraceId, generateSpanId;
 
 /// The entry point. One instance per app.
@@ -208,6 +212,11 @@ class Sentrinel {
       captureError(error, stack, fatal: true, mechanism: 'Isolate.onError');
     });
   }
+
+  // The port for `Isolate.spawn(onError:)` is the top-level `isolateErrorPort`,
+  // exported below. It cannot live here as a `SendPort?` without importing
+  // `dart:isolate` into this file, and typing it `dynamic` instead pushes an
+  // analyzer error onto every caller with strict-casts on.
 
   /// Run the app with uncaught errors reported automatically.
   ///
@@ -439,10 +448,12 @@ class SentrinelHttpClient extends http.BaseClient {
       final response = await _inner.send(request);
       watch.stop();
 
+      final path = request.url.path.isEmpty ? '/' : request.url.path;
+
       collector.recordRequest(RequestRecord(
         id: id,
         method: request.method,
-        path: request.url.path.isEmpty ? '/' : request.url.path,
+        path: path,
         statusCode: response.statusCode,
         responseTime: watch.elapsedMicroseconds / 1000.0,
         timestamp: started,
@@ -451,6 +462,25 @@ class SentrinelHttpClient extends http.BaseClient {
         consumerIdentifier: Sentrinel.consumer,
         traceId: trace.traceId,
         attributes: Sentrinel.context.isEmpty ? null : {...Sentrinel.context},
+      ));
+
+      // The client half of the waterfall. Its id is the one that went out on
+      // `traceparent`, so the server's span names it as parent and the two
+      // halves render as one tree. The difference between this duration and
+      // the server's is the network.
+      collector.recordSpan(SpanRecord(
+        id: trace.spanId,
+        traceId: trace.traceId,
+        name: '${request.method} $path',
+        startTime: started,
+        durationMs: watch.elapsedMicroseconds / 1000.0,
+        statusCode: response.statusCode >= 500 ? 'ERROR' : 'OK',
+        attributes: {
+          'http.method': request.method,
+          'http.url': request.url.toString(),
+          'http.status_code': response.statusCode,
+          if (Sentrinel.consumer != null) 'sentrinel.consumer': Sentrinel.consumer,
+        },
       ));
 
       // Left automatically, because a breadcrumb trail you have to remember to

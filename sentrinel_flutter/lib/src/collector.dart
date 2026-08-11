@@ -22,6 +22,7 @@ import 'models.dart';
 const int kMaxBufferedRequests = 500;
 const int kMaxBufferedErrors = 200;
 const int kMaxBufferedLogs = 500;
+const int kMaxBufferedSpans = 500;
 
 class SentrinelCollector {
   SentrinelCollector({
@@ -43,6 +44,7 @@ class SentrinelCollector {
   final List<RequestRecord> _requests = [];
   final List<ErrorRecord> _errors = [];
   final List<LogRecord> _logs = [];
+  final List<SpanRecord> _spans = [];
 
   Timer? _timer;
   bool _warned = false;
@@ -64,6 +66,10 @@ class SentrinelCollector {
 
   void recordRequest(RequestRecord record) {
     _push(_requests, record, kMaxBufferedRequests);
+  }
+
+  void recordSpan(SpanRecord record) {
+    _push(_spans, record, kMaxBufferedSpans);
   }
 
   void recordError(ErrorRecord record) {
@@ -113,6 +119,7 @@ class SentrinelCollector {
   /// Number of records waiting to be sent. Exposed for tests and diagnostics.
   int get pending =>
       _requests.length +
+      _spans.length +
       _errors.length +
       _logs.length +
       _sessions.length +
@@ -123,6 +130,7 @@ class SentrinelCollector {
 
     // Taken before any await so records arriving mid-flush are not lost.
     final requests = List<RequestRecord>.from(_requests);
+    final spans = List<SpanRecord>.from(_spans);
     final errors = List<ErrorRecord>.from(_errors);
     final logs = List<LogRecord>.from(_logs);
     final replayed = {
@@ -130,6 +138,7 @@ class SentrinelCollector {
     };
     final sessions = List<SessionRecord>.from(_sessions.values);
     _requests.clear();
+    _spans.clear();
     _errors.clear();
     _logs.clear();
     _sessions.clear();
@@ -168,6 +177,26 @@ class SentrinelCollector {
         'logs': allLogs,
       }));
     }
+    // One payload per span. The trace ingest route takes a trace and its
+    // spans together, and a client span is the root of its own trace — the
+    // server's span arrives separately and joins by parent id.
+    for (final span in spans) {
+      sends.add(_post('/api/ingest/traces', {
+        'appName': appName,
+        'env': env,
+        'traceId': span.traceId,
+        'name': span.name,
+        'startTime': span.startTime.toUtc().toIso8601String(),
+        'endTime': span.startTime
+            .add(Duration(microseconds: (span.durationMs * 1000).round()))
+            .toUtc()
+            .toIso8601String(),
+        'durationMs': span.durationMs,
+        'statusCode': span.statusCode == 'ERROR' ? 500 : 200,
+        'spans': [span.toJson()],
+      }));
+    }
+
     final allSessions = [
       ...?replayed['session'],
       ...sessions.map((s) => s.toJson()),
@@ -179,7 +208,113 @@ class SentrinelCollector {
         'sessions': allSessions,
       }));
     }
+
+    // The per-endpoint rollup, alongside the individual rows above.
+    //
+    // Not redundant with them: the dashboard's headline numbers — request
+    // count, error rate, p95, the Traffic and Performance charts — all read
+    // the rollup, while the request rows feed the log view. Sending only the
+    // rows meant a Flutter app that was reporting perfectly showed "0
+    // requests, 0.0%, 0 ms" on the Apps page, which is the exact screen
+    // someone opens to check whether their integration works.
+    if (allRequests.isNotEmpty) {
+      sends.add(_post('/api/ingest/metrics', {
+        'appName': appName,
+        'env': env,
+        'timestamp': DateTime.now().toUtc().toIso8601String(),
+        'endpoints': _rollUpEndpoints(allRequests),
+        'consumers': _rollUpConsumers(allRequests),
+      }));
+    }
+
     await Future.wait(sends);
+  }
+
+  /// Groups this batch's requests by method+path into the shape
+  /// `/api/ingest/metrics` stores.
+  ///
+  /// The percentiles are computed over one flush, which is a smaller window
+  /// than a server's — but it is the same window the server plugin uses, and
+  /// the API averages across rows when it charts them.
+  List<Map<String, dynamic>> _rollUpEndpoints(List<Map<String, dynamic>> requests) {
+    final groups = <String, List<Map<String, dynamic>>>{};
+    for (final r in requests) {
+      groups.putIfAbsent('${r['method']} ${r['path']}', () => []).add(r);
+    }
+
+    return groups.values.map((rows) {
+      final times = rows.map((r) => (r['responseTime'] as num).toDouble()).toList()..sort();
+      final statusCodes = <String, int>{};
+      var errors = 0;
+      var requestSize = 0;
+      var responseSize = 0;
+      for (final r in rows) {
+        final status = (r['statusCode'] as num).toInt();
+        statusCodes['$status'] = (statusCodes['$status'] ?? 0) + 1;
+        if (status >= 400) errors++;
+        requestSize += ((r['requestSize'] ?? 0) as num).toInt();
+        responseSize += ((r['responseSize'] ?? 0) as num).toInt();
+      }
+
+      return {
+        'method': rows.first['method'],
+        'path': rows.first['path'],
+        'requestCount': rows.length,
+        'successCount': rows.length - errors,
+        'errorCount': errors,
+        'avgResponseTime': times.reduce((a, b) => a + b) / times.length,
+        'minResponseTime': times.first,
+        'maxResponseTime': times.last,
+        'p50ResponseTime': _percentile(times, 0.5),
+        'p95ResponseTime': _percentile(times, 0.95),
+        'p99ResponseTime': _percentile(times, 0.99),
+        'totalRequestSize': requestSize,
+        'totalResponseSize': responseSize,
+        'statusCodes': statusCodes,
+      };
+    }).toList();
+  }
+
+  /// One row per consumer per endpoint, matching the server plugin. Requests
+  /// with no consumer identifier are left out rather than bucketed under a
+  /// placeholder, which would invent a consumer nobody can act on.
+  List<Map<String, dynamic>> _rollUpConsumers(List<Map<String, dynamic>> requests) {
+    final groups = <String, List<Map<String, dynamic>>>{};
+    for (final r in requests) {
+      final id = r['consumerIdentifier'];
+      if (id == null || (id is String && id.isEmpty)) continue;
+      groups.putIfAbsent('$id ${r['method']} ${r['path']}', () => []).add(r);
+    }
+
+    return groups.values.map((rows) {
+      var errors = 0;
+      var total = 0.0;
+      for (final r in rows) {
+        if ((r['statusCode'] as num).toInt() >= 400) errors++;
+        total += (r['responseTime'] as num).toDouble();
+      }
+      return {
+        'identifier': rows.first['consumerIdentifier'],
+        'method': rows.first['method'],
+        'path': rows.first['path'],
+        'requestCount': rows.length,
+        'errorCount': errors,
+        'totalResponseTime': total,
+      };
+    }).toList();
+  }
+
+  /// Linear-interpolated percentile over an already-sorted list — the same
+  /// method the server plugin uses, so a Flutter app's p95 and a backend's
+  /// mean the same thing.
+  double _percentile(List<double> sorted, double q) {
+    if (sorted.isEmpty) return 0;
+    if (sorted.length == 1) return sorted.first;
+    final pos = (sorted.length - 1) * q;
+    final lower = pos.floor();
+    final upper = pos.ceil();
+    if (lower == upper) return sorted[lower];
+    return sorted[lower] + (sorted[upper] - sorted[lower]) * (pos - lower);
   }
 
   Future<void> _post(String path, Map<String, dynamic> body) async {

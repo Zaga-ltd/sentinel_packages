@@ -419,13 +419,80 @@ describe("tunnel", () => {
     );
 
     expect(res.status).toBe(202);
+    // `accepted` counts the records the page sent, not the requests made of
+    // the API — the rollup below is derived from those same records, and
+    // counting it again would report more than arrived.
     expect(await res.json()).toEqual({ accepted: 3 });
     expect(captured.map((c) => c.url).sort()).toEqual([
       "https://api.sentrinel.dev/api/ingest/errors",
+      // Derived from `requests`, not sent by the page. Without it the Apps
+      // page reads zero for a site that is reporting correctly.
+      "https://api.sentrinel.dev/api/ingest/metrics",
       "https://api.sentrinel.dev/api/ingest/requests",
       "https://api.sentrinel.dev/api/ingest/sessions",
     ]);
     expect(captured.every((c) => c.key === "snt_live_secret")).toBe(true);
+  });
+
+  // The bug this guards against: for months the browser SDK sent per-request
+  // rows and nothing else, so Request logs had data while Overview, Traffic,
+  // Performance and the Apps card all read zero. Both shapes, or the feature
+  // is invisible on the screen people check first.
+  test("browser requests also produce the per-endpoint rollup", async () => {
+    const tunnel = createSentrinelTunnel(opts);
+    await tunnel(
+      post({
+        requests: [
+          { id: "r1", method: "GET", path: "/api/x", statusCode: 200, responseTime: 10 },
+          { id: "r2", method: "GET", path: "/api/x", statusCode: 500, responseTime: 30 },
+          { id: "r3", method: "POST", path: "/api/y", statusCode: 201, responseTime: 20 },
+        ],
+      })
+    );
+
+    const metrics = captured.find((c) => c.url.endsWith("/api/ingest/metrics"))!;
+    expect(metrics).toBeDefined();
+
+    const endpoints = metrics.body.endpoints as any[];
+    expect(endpoints).toHaveLength(2);
+
+    const getX = endpoints.find((e) => e.method === "GET" && e.path === "/api/x")!;
+    expect(getX.requestCount).toBe(2);
+    expect(getX.errorCount).toBe(1);
+    expect(getX.successCount).toBe(1);
+    expect(getX.statusCodes).toEqual({ "200": 1, "500": 1 });
+    expect(getX.avgResponseTime).toBe(20);
+  });
+
+  test("the rollup credits the server-resolved consumer, not the page's claim", async () => {
+    // Same rule as sessions: a page can assert any identity, so the tunnel's
+    // own answer has to win here too or the Consumers table is forgeable.
+    const tunnel = createSentrinelTunnel({
+      ...opts,
+      consumerIdentifier: (req) => req.headers.get("x-user") ?? undefined,
+    });
+    await tunnel(
+      post(
+        {
+          requests: [
+            {
+              id: "r1",
+              method: "GET",
+              path: "/api/x",
+              statusCode: 200,
+              responseTime: 10,
+              consumerIdentifier: "i-say-i-am-admin",
+            },
+          ],
+        },
+        { "x-user": "real-user-42" }
+      )
+    );
+
+    const metrics = captured.find((c) => c.url.endsWith("/api/ingest/metrics"))!;
+    const consumers = metrics.body.consumers as any[];
+    expect(consumers).toHaveLength(1);
+    expect(consumers[0].identifier).toBe("real-user-42");
   });
 
   test("appName and env come from the server, never the browser", async () => {

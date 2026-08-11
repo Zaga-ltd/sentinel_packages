@@ -20,6 +20,15 @@ export interface TraceContext {
   rootSpanId: string;
   currentSpanId: string;
   spans: Span[];
+  /**
+   * The caller's span id, when this request arrived with `traceparent`.
+   *
+   * Distinct from `currentSpanId`, which moves as spans open and close. This
+   * one is fixed for the request and is what the server span records as its
+   * parent, so a mobile or browser client's span and the server work it caused
+   * join into one tree instead of two roots sharing a trace id.
+   */
+  inboundSpanId?: string;
 }
 
 export const traceStorage = new AsyncLocalStorage<TraceContext>();
@@ -197,7 +206,22 @@ export async function traceSpan<T>(
   const spanId = generateSpanId();
   const parentId = store.currentSpanId;
   const startTime = new Date();
-  const spanAttrs: Record<string, any> = { ...attributes };
+  // Which tier this ran on, so the waterfall can say so.
+  //
+  // Inferred from the name rather than the OTel kind, because `kind` does not
+  // answer the question: a CLIENT span is emitted by a phone, a browser and a
+  // backend calling another service alike. An explicit `sentrinel.source` in
+  // the caller's attributes always wins.
+  const inferredSource = name.startsWith("db.")
+    ? "database"
+    : name.startsWith("http.client") || kind === "CLIENT"
+      ? "outbound"
+      : "backend";
+
+  const spanAttrs: Record<string, any> = {
+    "sentrinel.source": inferredSource,
+    ...attributes,
+  };
 
   const spanObj: Span = {
     id: spanId,

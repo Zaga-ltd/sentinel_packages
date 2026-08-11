@@ -2,4 +2,11 @@ node_modules/
 *.log
 sentrinel_flutter/.dart_tool/
 sentrinel_flutter/pubspec.lock
+
+# Never publish local application data that happens to sit in this folder.
 Claude/
+.claude/
+*.pem
+*.key
+.env
+.env.*

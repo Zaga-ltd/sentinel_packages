@@ -50,7 +50,33 @@ export interface SentrinelPluginOptions {
    * (the framework adapters read it straight off the request) or a function
    * that derives one from the request context.
    */
-  consumerIdentifier?: string | ((ctx: any) => string | null | undefined);
+  /**
+   * Who is calling.
+   *
+   * A bare string names a header to read. A function may return either a
+   * string, or a [ConsumerIdentity] when you also have a display name or a
+   * segment to attach.
+   */
+  consumerIdentifier?:
+    | string
+    | ((ctx: any) => string | ConsumerIdentity | null | undefined);
+
+  /**
+   * What to do when a batch cannot be delivered.
+   *
+   * Failed payloads are held and re-sent with exponential backoff rather than
+   * discarded. Only failures retrying can fix are kept — a 401 or a 422 is
+   * dropped at once, because it would fail identically forever and would only
+   * crowd out payloads that could still land.
+   */
+  retry?: {
+    /** Payloads held at once; past this the oldest is dropped. Default 100. */
+    maxQueued?: number;
+    /** Attempts per payload before giving up. Default 5. */
+    maxAttempts?: number;
+    /** First backoff step in ms; doubles each attempt. Default 5000. */
+    baseDelayMs?: number;
+  };
 
   /** Paths to exclude from monitoring (regex patterns) */
   excludePaths?: (string | RegExp)[];
@@ -118,6 +144,8 @@ export interface EndpointMetrics {
 
 export interface ConsumerRequestMetrics {
   consumerIdentifier: string;
+  consumerName?: string;
+  consumerGroup?: string;
   method: string;
   path: string;
   requestCount: number;
@@ -162,6 +190,16 @@ export interface RequestLogEntry {
   timestamp: string;
   /** Effective sampling rate this entry was captured at (1 = unsampled). */
   sampleRate?: number;
+  /**
+   * The caller's address, resolved from proxy headers. Only this process can
+   * still see it — by the time the payload reaches Sentrinel, the only address
+   * left is the customer's own server.
+   */
+  clientIp?: string;
+  /** ISO-3166 alpha-2 from the edge, when something upstream resolved one. */
+  country?: string;
+  /** The Host the client addressed. */
+  host?: string;
 }
 
 // ─── Payloads sent to Sentrinel API ──────────────────────────────────────────────
@@ -190,6 +228,8 @@ export interface MetricsPayload {
   }[];
   consumers: {
     identifier: string;
+    name?: string;
+    group?: string;
     method: string;
     path: string;
     requestCount: number;
@@ -197,6 +237,8 @@ export interface MetricsPayload {
     totalResponseTime: number;
   }[];
   resourceUsage?: {
+    /** Which process reported this. See INSTANCE_ID in collector.ts. */
+    instanceId?: string;
     cpuUsage: number;
     memoryRss: number;
     memoryHeapTotal: number;
@@ -252,4 +294,47 @@ export interface ErrorPayload {
     /** Business context attached with addRequestContext(). */
     attributes?: Record<string, unknown>;
   }[];
+}
+
+/**
+ * A caller, identified.
+ *
+ * Three fields on purpose, and no more. `identifier` is what everything joins
+ * on, so it must be **stable across requests for the same actor** — a session
+ * id or a per-request uuid here creates one consumer row per request, and that
+ * table is joined on every Consumers query.
+ *
+ * Contact details are deliberately absent. An identifier fans out into request
+ * logs, span attributes, issue rows and exports; a phone number in that set is
+ * a personal-data breach waiting to happen and answers no question the tool
+ * exists to answer — you already hold the contact details in your own database,
+ * keyed by exactly this id. Use `consumerUrl` to link there instead.
+ */
+export interface ConsumerIdentity {
+  /** Stable, opaque key. A user id or tenant id — not an email or a phone. */
+  identifier: string;
+  /** Display label, so the UI reads as names rather than uuids. */
+  name?: string;
+  /** The segment to slice by: plan tier, tenant, region, app version. */
+  group?: string;
+}
+
+/**
+ * Normalise whatever a resolver returned into the three fields we store.
+ *
+ * Shared by every adapter so a `ConsumerIdentity` behaves identically on
+ * Elysia, Bun and Express — the alternative is three near-copies that drift,
+ * and an object silently stringifying to "[object Object]" on the two that
+ * were not updated.
+ */
+export function resolveConsumer(
+  value: string | ConsumerIdentity | null | undefined
+): { identifier: string | null; name?: string; group?: string } {
+  if (!value) return { identifier: null };
+  if (typeof value === "string") return { identifier: value };
+  return {
+    identifier: value.identifier || null,
+    name: value.name,
+    group: value.group,
+  };
 }

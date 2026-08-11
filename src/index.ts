@@ -1,6 +1,7 @@
 import { Elysia } from "elysia";
 import { MetricsCollector } from "./collector";
 import { maskQueryParams, maskHeaders, maskBodyFields, truncateBody } from "./masking";
+import { clientIp, clientCountry, requestHost } from "./client";
 import type { SentrinelPluginOptions, RequestLogEntry } from "./types";
 import { shouldCaptureLog } from "./sampling";
 import { instrumentConsole, beginRequestLogContext, drainRequestLogs } from "./logs";
@@ -148,6 +149,34 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
     // Keyed by the Request itself, weakly, so nothing is retained after the
     // response is done.
     const capturedPayloads = new WeakMap<Request, string>();
+
+    /**
+     * Caller origin, captured in `onRequest` and looked up later by identity.
+     *
+     * Both halves of that matter. It has to be read in `onRequest` because the
+     * context handed to `derive` and the afterResponse hook is lazy: reading
+     * *any* property off its `request` — even `.headers` — makes Elysia resolve
+     * and parse the body, which drains the stream and 500s routes that read it
+     * themselves. Using the same object purely as a WeakMap key touches no
+     * property and is safe, which is why `capturedPayloads` above gets away
+     * with it too.
+     */
+    const capturedOrigins = new WeakMap<
+      Request,
+      { clientIp?: string; country?: string; host?: string }
+    >();
+
+    app.onRequest(({ request }: any) => {
+      try {
+        capturedOrigins.set(request, {
+          clientIp: clientIp(request.headers),
+          country: clientCountry(request.headers),
+          host: requestHost(request.headers),
+        });
+      } catch {
+        // Telemetry is best-effort; never fail a request over provenance.
+      }
+    });
     if (options.requestLogging?.logRequestBody) {
       app.onRequest(async ({ request }: any) => {
         try {
@@ -178,8 +207,12 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
         rootSpanId: generateSpanId(),
         currentSpanId: "",
         spans: [],
+        inboundSpanId: incoming?.parentSpanId,
       };
-      traceCtx.currentSpanId = incoming?.parentSpanId ?? traceCtx.rootSpanId;
+      // Child spans hang off this request's own server span. Pointing them at
+      // the caller's span instead would make the server span a sibling of the
+      // work it performed rather than its parent.
+      traceCtx.currentSpanId = traceCtx.rootSpanId;
       // enterWith keeps the store for the rest of this request's async work,
       // which is what handlers run inside.
       traceStorage.enterWith(traceCtx);
@@ -196,6 +229,8 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
         _sentrinelTrace: traceCtx,
         _sentrinelTraceStart: new Date().toISOString(),
         _sentrinelReqPayload: capturedPayload,
+        // Looked up by identity, never by property access — see below.
+        _sentrinelOrigin: capturedOrigins.get(request),
       };
     });
 
@@ -254,6 +289,8 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
 
         // Get consumer identifier
         let consumerIdentifier: string | null | undefined = null;
+        let consumerName: string | undefined;
+        let consumerGroup: string | undefined;
         if (typeof options.consumerIdentifier === "function") {
           try {
             // Hand the resolver an explicit, field-by-field view rather than
@@ -273,7 +310,17 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
               store: ctx.store,
               response: ctx.response,
             };
-            consumerIdentifier = options.consumerIdentifier(safeCtx);
+            const resolved = options.consumerIdentifier(safeCtx);
+            // A resolver may hand back a bare id or the fuller identity. The
+            // identifier is the only part anything joins on; name and group are
+            // decoration, and an object missing the id is not usable at all.
+            if (resolved && typeof resolved === "object") {
+              consumerIdentifier = resolved.identifier || null;
+              consumerName = resolved.name;
+              consumerGroup = resolved.group;
+            } else {
+              consumerIdentifier = resolved;
+            }
           } catch {}
         } else if (typeof options.consumerIdentifier === "string") {
           // Header-name shorthand, matching the Express/Next adapters.
@@ -289,6 +336,8 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
           requestSize,
           responseSize,
           consumerIdentifier,
+          consumerName,
+          consumerGroup,
         });
 
         const requestLogId = (ctx as any)._sentrinelRequestLogId as string;
@@ -369,7 +418,15 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
           const rootSpan = {
             id: traceCtx.rootSpanId,
             traceId: traceCtx.traceId,
-            parentId: null,
+            // The caller's span, when one arrived on `traceparent`.
+            //
+            // Hardcoding null here is what kept a mobile or browser request off
+            // the same waterfall as the server work it caused: the trace id
+            // matched, so the records grouped, but nothing joined the two ends
+            // and the timeline began at the server. With the parent set, the
+            // client span is the root and the gap between it and this span is
+            // the network — which is usually the part being argued about.
+            parentId: traceCtx.inboundSpanId ?? null,
             name: `${method} ${routePath}`,
             kind: "SERVER",
             startTime: traceStart,
@@ -377,6 +434,7 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
             durationMs: Math.round(responseTime * 100) / 100,
             statusCode: statusCode >= 500 ? "ERROR" : "OK",
             attributes: {
+              "sentrinel.source": "backend",
               "http.method": method,
               "http.route": routePath,
               "http.status_code": statusCode,
@@ -426,6 +484,10 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
             // Whatever the handler attached via addRequestContext() — the
             // business half of the canonical event.
             attributes: canonicalFields,
+            // Where the call came from and which host answered it, read off
+            // the context rather than from `ctx.request` — see the derive hook
+            // for why touching the request here is not safe.
+            ...((ctx as any)._sentrinelOrigin ?? {}),
           };
 
           // Log headers (masked)

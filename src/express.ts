@@ -17,6 +17,7 @@ import {
   type LogRecord,
 } from "./logger";
 import type { SentrinelPluginOptions, RequestLogEntry } from "./types";
+import { resolveConsumer } from "./types";
 
 // Structural types — no `import type from "express"` needed.
 interface Request {
@@ -133,8 +134,15 @@ export function sentrinelExpressMiddleware(options: SentrinelPluginOptions) {
 
       // Consumer identifier
       let consumerIdentifier: string | null | undefined = null;
+      let consumerName: string | undefined;
+      let consumerGroup: string | undefined;
       if (typeof options.consumerIdentifier === "function") {
-        try { consumerIdentifier = options.consumerIdentifier({ request: req } as any); } catch {}
+        try {
+          const r = resolveConsumer(options.consumerIdentifier({ request: req } as any));
+          consumerIdentifier = r.identifier;
+          consumerName = r.name;
+          consumerGroup = r.group;
+        } catch {}
       } else if (typeof options.consumerIdentifier === "string") {
         consumerIdentifier = req.headers[options.consumerIdentifier.toLowerCase()] as string;
       }
@@ -159,6 +167,8 @@ export function sentrinelExpressMiddleware(options: SentrinelPluginOptions) {
         requestSize,
         responseSize,
         consumerIdentifier,
+        consumerName,
+        consumerGroup,
       });
 
       // Record errors

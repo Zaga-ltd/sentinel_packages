@@ -10,6 +10,10 @@ class IsolateErrorSubscription {
   void close() {}
 }
 
+/// Always null here: no isolates, so nothing to hand a worker. Declared so
+/// calling code compiles unchanged on both platforms.
+Null get isolateErrorPort => null;
+
 IsolateErrorSubscription? listenForIsolateErrors(
   void Function(String error, StackTrace? stack) onError,
 ) =>

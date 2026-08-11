@@ -8,6 +8,29 @@ import type {
   ErrorPayload,
   AppLogsPayload,
 } from "./types";
+import { RetryQueue } from "./retry";
+import { hostname } from "node:os";
+
+/**
+ * Which process these metrics came from.
+ *
+ * Without it every instance of an app reports into one undifferentiated
+ * stream, and the dashboard averages them — so a single instance pegged at
+ * 100% CPU while three others idle shows as a comfortable 25%, and the one
+ * that is about to fall over is invisible.
+ *
+ * Hostname plus pid: in a container the hostname is the container id, which is
+ * exactly the granularity wanted, and the pid separates workers on a machine
+ * running several. Computed once — os.hostname() is a syscall and this is on
+ * the flush path.
+ */
+const INSTANCE_ID = (() => {
+  try {
+    return `${hostname()}:${process.pid}`.slice(0, 128);
+  } catch {
+    return `pid:${process.pid}`;
+  }
+})();
 
 // ─── Metrics Collector ──────────────────────────────────────────────────────────
 // Buffers metrics in memory and flushes to the Sentrinel API server periodically
@@ -24,12 +47,26 @@ export class MetricsCollector {
   private isFlushing = false;
   /** Problems already reported, so a broken pipe warns once, not every flush. */
   private warned = new Set<string>();
+  /**
+   * Payloads a failed send is holding on to.
+   *
+   * Without this a flush that fails loses its window outright — the buffers
+   * are emptied before the post, so there is nothing left to try again with.
+   */
+  private retries: RetryQueue;
   
   private lastCpuUsage: NodeJS.CpuUsage;
   private lastCpuTime: number;
 
   constructor(options: SentrinelPluginOptions) {
     this.options = options;
+    // Built here, not as a field initializer: those run before the constructor
+    // body, so `this.options` would still be undefined.
+    this.retries = new RetryQueue({
+      maxQueued: options.retry?.maxQueued,
+      maxAttempts: options.retry?.maxAttempts,
+      baseDelayMs: options.retry?.baseDelayMs,
+    });
     this.lastCpuUsage = process.cpuUsage();
     this.lastCpuTime = Date.now();
   }
@@ -60,6 +97,8 @@ export class MetricsCollector {
     requestSize: number;
     responseSize: number;
     consumerIdentifier?: string | null;
+    consumerName?: string;
+    consumerGroup?: string;
   }): void {
     const key = `${data.method}:${data.path}`;
     const isError = data.statusCode >= 400;
@@ -98,6 +137,8 @@ export class MetricsCollector {
       if (!cMetrics) {
         cMetrics = {
           consumerIdentifier: data.consumerIdentifier,
+          consumerName: data.consumerName,
+          consumerGroup: data.consumerGroup,
           method: data.method,
           path: data.path,
           requestCount: 0,
@@ -139,6 +180,9 @@ export class MetricsCollector {
 
     try {
       const promises: Promise<void>[] = [];
+
+      // Anything a previous flush could not deliver, first.
+      promises.push(this.drainRetries());
 
       // Flush metrics
       if (this.endpointMetrics.size > 0) {
@@ -247,8 +291,37 @@ export class MetricsCollector {
       };
     });
 
+    // Cardinality guard.
+    //
+    // `identifier` is a dimension, and it must be stable for the same actor
+    // across requests. Feed it a session id, a request id or a device id and
+    // you get one consumer row per request — a table that grows without bound
+    // and is joined on every Consumers query. It looks fine in staging and only
+    // shows up under real traffic, so say something the first time the shape
+    // looks wrong rather than waiting for someone to notice the row count.
+    const distinctConsumers = new Set(
+      Array.from(this.consumerMetrics.values()).map((c) => c.consumerIdentifier)
+    ).size;
+    const totalRequests = Array.from(this.endpointMetrics.values()).reduce(
+      (sum, e) => sum + e.requestCount,
+      0
+    );
+    if (totalRequests >= 50 && distinctConsumers > totalRequests * 0.8) {
+      this.warnOnce(
+        "consumer-cardinality",
+        `${distinctConsumers} distinct consumers across ${totalRequests} requests — ` +
+          "consumerIdentifier looks like it is returning something per-request " +
+          "(a session or request id). It must be stable for the same user, or the " +
+          "consumers table grows without bound."
+      );
+    }
+
     const consumers = Array.from(this.consumerMetrics.values()).map((c) => ({
       identifier: c.consumerIdentifier,
+      // Only sent when the resolver supplied them; a bare string identifier
+      // leaves both undefined and the server keeps whatever it already has.
+      ...(c.consumerName ? { name: c.consumerName } : {}),
+      ...(c.consumerGroup ? { group: c.consumerGroup } : {}),
       method: c.method,
       path: c.path,
       requestCount: c.requestCount,
@@ -265,6 +338,7 @@ export class MetricsCollector {
       endpoints,
       consumers,
       resourceUsage: {
+        instanceId: INSTANCE_ID,
         cpuUsage: cpuUsagePercent,
         memoryRss: memUsage.rss,
         memoryHeapTotal: memUsage.heapTotal,
@@ -273,8 +347,12 @@ export class MetricsCollector {
     };
   }
 
-  /** Send payload to the Sentrinel API server */
-  private async sendToServer(path: string, payload: any): Promise<void> {
+  /**
+   * Send a payload, holding it for another attempt if the failure looks
+   * temporary. `attempts` is how many sends have already failed for this exact
+   * payload — 0 for a fresh one, higher when the retry queue hands it back.
+   */
+  private async sendToServer(path: string, payload: any, attempts = 0): Promise<void> {
     const url = `${this.options.serverUrl}${path}`;
     try {
       const headers: Record<string, string> = {
@@ -308,6 +386,9 @@ export class MetricsCollector {
         } else {
           this.warnOnce(`${path}`, `send failed: ${res.status} ${res.statusText}. ${detail}`);
         }
+        // 4xx other than 429 is a payload or credential problem: it will fail
+        // the same way forever, so it is dropped rather than queued.
+        this.retries.enqueue(path, payload, res.status, attempts);
         return;
       }
       // Recovered — allow the next failure to be reported again.
@@ -317,7 +398,40 @@ export class MetricsCollector {
         `connect:${path}`,
         `cannot reach the Sentrinel server at ${url} — ${(err as Error)?.message ?? err}`
       );
+      // Never reached the server at all, which is the most retryable failure
+      // there is: undefined status means "transport", not "rejected".
+      this.retries.enqueue(path, payload, undefined, attempts);
     }
+  }
+
+  /**
+   * Re-send whatever has come due, before this flush's own payloads.
+   *
+   * Order matters: retries first keeps the queue draining during a partial
+   * outage instead of being permanently overtaken by fresh data.
+   */
+  private async drainRetries(): Promise<void> {
+    const due = this.retries.due();
+    if (!due.length) return;
+
+    await Promise.allSettled(
+      due.map((item) => this.sendToServer(item.path, item.body, item.attempts))
+    );
+
+    const dropped = this.retries.drainDropCounts();
+    if (dropped.space || dropped.attempts) {
+      // Loud on purpose. Data was discarded; that should never be inferable
+      // only from a gap in a chart.
+      console.warn(
+        `[sentrinel] dropped telemetry: ${dropped.space} over queue limit, ` +
+          `${dropped.attempts} after exhausting retries`
+      );
+    }
+  }
+
+  /** How many payloads are waiting to be retried — surfaced for tests. */
+  get pendingRetries(): number {
+    return this.retries.size;
   }
 
   /**

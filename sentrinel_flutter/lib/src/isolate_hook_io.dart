@@ -10,8 +10,32 @@ class IsolateErrorSubscription {
 
   final RawReceivePort _port;
 
-  void close() => _port.close();
+  /// Where a spawned isolate should send its uncaught errors.
+  SendPort get errorPort => _port.sendPort;
+
+  void close() {
+    if (identical(_active, _port.sendPort)) _active = null;
+    _port.close();
+  }
 }
+
+SendPort? _active;
+
+/// The port to hand `Isolate.spawn(onError:)`.
+///
+/// [Isolate.spawn] does not inherit the spawner's error listeners — a worker
+/// started without `onError` prints its crash to stderr and reports nothing.
+/// Passing this port is what connects it:
+///
+/// ```dart
+/// await Isolate.spawn(work, message, onError: isolateErrorPort);
+/// ```
+///
+/// Lives here rather than on `Sentrinel` so it can be typed `SendPort?`
+/// without `sentrinel.dart` importing `dart:isolate`, which would break the
+/// web build. Null before `Sentrinel.init`; `Isolate.spawn` accepts a null
+/// `onError`, so it stays safe to pass either way.
+SendPort? get isolateErrorPort => _active;
 
 /// Errors thrown on other isolates never reach a zone handler on this one.
 ///
@@ -31,6 +55,7 @@ IsolateErrorSubscription? listenForIsolateErrors(
       }
     });
     Isolate.current.addErrorListener(port.sendPort);
+    _active = port.sendPort;
     return IsolateErrorSubscription(port);
   } catch (_) {
     // Not supported on every platform; nothing else depends on it.

@@ -26,6 +26,8 @@
  * ```
  */
 
+import { rollUpConsumers, rollUpEndpoints, type RollupRequest } from "./rollup";
+
 export interface SentrinelTunnelOptions {
   /** The Sentrinel API, e.g. `https://api.sentrinel.dev`. */
   serverUrl: string;
@@ -42,6 +44,8 @@ export interface SentrinelTunnelOptions {
    * anything is a memory-exhaustion target.
    */
   maxBodyBytes?: number;
+  /** Ceiling for a session-replay chunk. Defaults to 4MB. */
+  maxReplayBytes?: number;
   /**
    * Who sent this, derived from the request — a session cookie, a header, an
    * authenticated user. Overrides whatever the browser claimed, because a
@@ -59,12 +63,29 @@ export interface TunnelBatch {
   errors?: Record<string, unknown>[];
   requests?: Record<string, unknown>[];
   sessions?: Record<string, unknown>[];
+  events?: Record<string, unknown>[];
+  anonymousId?: string;
+  userId?: string;
+  sessionId?: string;
+  /** A session-replay chunk. Arrives alone, and is far larger than the rest. */
+  replay?: Record<string, unknown>;
 }
 
 const DEFAULT_MAX_BODY = 512 * 1024;
 
+/**
+ * Separate, larger ceiling for session-replay chunks.
+ *
+ * A record batch that reaches half a megabyte is a runaway loop, so the small
+ * default is a useful alarm. A replay chunk is a DOM snapshot and *starts*
+ * near that size — holding it to the same limit would reject the feature
+ * rather than protect anything. Matches MAX_CHUNK_BYTES on the ingest side, so
+ * a payload that passes here is not rejected one hop later.
+ */
+const DEFAULT_MAX_REPLAY_BODY = 4 * 1024 * 1024;
+
 /** Caps mirroring the ingest endpoints, applied before anything leaves. */
-const LIMITS = { errors: 2_000, requests: 5_000, sessions: 1_000 } as const;
+const LIMITS = { errors: 2_000, requests: 5_000, sessions: 1_000, events: 5_000 } as const;
 
 /**
  * Build the handler.
@@ -84,6 +105,7 @@ export function createSentrinelTunnel(
     apiKey,
     release,
     maxBodyBytes = DEFAULT_MAX_BODY,
+    maxReplayBytes = DEFAULT_MAX_REPLAY_BODY,
     consumerIdentifier,
     beforeForward,
     debug,
@@ -101,8 +123,10 @@ export function createSentrinelTunnel(
 
     // Check the declared length before reading, so an oversized body is
     // rejected rather than buffered.
+    // Checked against the larger ceiling because the kind of payload is not
+    // known until it is parsed; the tighter record-batch limit is applied below.
     const declared = Number(request.headers.get("content-length") ?? 0);
-    if (declared > maxBodyBytes) {
+    if (declared > Math.max(maxBodyBytes, maxReplayBytes)) {
       return json({ error: "Batch too large" }, 413);
     }
 
@@ -112,7 +136,9 @@ export function createSentrinelTunnel(
     } catch {
       return json({ error: "Unreadable body" }, 400);
     }
-    if (raw.length > maxBodyBytes) return json({ error: "Batch too large" }, 413);
+    if (raw.length > Math.max(maxBodyBytes, maxReplayBytes)) {
+      return json({ error: "Batch too large" }, 413);
+    }
 
     let batch: TunnelBatch;
     try {
@@ -121,6 +147,12 @@ export function createSentrinelTunnel(
       return json({ error: "Invalid JSON" }, 400);
     }
     if (!batch || typeof batch !== "object") return json({ error: "Invalid batch" }, 400);
+
+    // Now that the shape is known, hold a plain record batch to the tighter
+    // limit. Only a replay chunk is allowed to be large.
+    if (!batch.replay && raw.length > maxBodyBytes) {
+      return json({ error: "Batch too large" }, 413);
+    }
 
     if (beforeForward) {
       const kept = beforeForward(batch, request);
@@ -145,18 +177,67 @@ export function createSentrinelTunnel(
       ...(effectiveRelease ? { release: s.release ?? effectiveRelease } : {}),
       ...(consumer ? { userId: consumer } : {}),
     }));
+    // Product events. The server-side consumer wins over whatever the page
+    // claimed, exactly as it does for sessions — a page can assert any user id,
+    // and this endpoint is the only place that knows who is really signed in.
+    const events = take(batch.events, LIMITS.events).map((e) => ({
+      ...e,
+      ...(consumer ? { userId: consumer } : {}),
+    }));
+
+    // A replay chunk arrives alone, in its own request — see BatchPayload.
+    // Forwarded first because it is the one payload with a size limit worth
+    // failing fast on.
+    if (batch.replay) {
+      await forward("/api/ingest/replay", {
+        appName,
+        env,
+        ...batch.replay,
+        release: effectiveRelease,
+      });
+      return json({ accepted: 1 }, 202);
+    }
 
     const sends: Promise<void>[] = [];
     if (errors.length) sends.push(forward("/api/ingest/errors", { appName, env, errors }));
-    if (requests.length) sends.push(forward("/api/ingest/requests", { appName, env, requests }));
+    if (requests.length) {
+      sends.push(forward("/api/ingest/requests", { appName, env, requests }));
+      // The same requests, aggregated. Both are needed and they are not
+      // interchangeable: the rows above are the log view, and this is every
+      // headline number on the Apps and Overview pages. Derived here rather
+      // than in the page so a browser SDK ships no extra bytes for it, and so
+      // the arithmetic stays next to the server's — see rollup.ts.
+      sends.push(
+        forward("/api/ingest/metrics", {
+          appName,
+          env,
+          timestamp: new Date().toISOString(),
+          endpoints: rollUpEndpoints(requests as unknown as RollupRequest[]),
+          consumers: rollUpConsumers(requests as unknown as RollupRequest[]),
+        }),
+      );
+    }
     if (sessions.length) sends.push(forward("/api/ingest/sessions", { appName, env, sessions }));
+    if (events.length) {
+      sends.push(
+        forward("/api/ingest/events", {
+          appName,
+          env,
+          release: effectiveRelease,
+          anonymousId: batch.anonymousId,
+          userId: consumer ?? batch.userId,
+          sessionId: batch.sessionId,
+          events,
+        })
+      );
+    }
 
     // Not awaited on the page's behalf — but awaited here, because a serverless
     // function that returns first may be frozen before the fetch completes.
     await Promise.allSettled(sends);
 
     return json(
-      { accepted: errors.length + requests.length + sessions.length },
+      { accepted: errors.length + requests.length + sessions.length + events.length },
       202
     );
 

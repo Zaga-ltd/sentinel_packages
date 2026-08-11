@@ -16,6 +16,7 @@ import { parseTraceParent, generateTraceId, generateSpanId } from "./tracer";
 import { maskHeaders, maskBodyFields, maskQueryParams, truncateBody } from "./masking";
 import { shouldCaptureLog } from "./sampling";
 import type { SentrinelPluginOptions, RequestLogEntry } from "./types";
+import { resolveConsumer } from "./types";
 
 type FetchHandler = (req: Request, server: any) => Response | Promise<Response>;
 
@@ -57,8 +58,15 @@ export function sentrinelBunMiddleware(
 
     // Consumer identifier
     let consumerIdentifier: string | null | undefined = null;
+    let consumerName: string | undefined;
+    let consumerGroup: string | undefined;
     if (typeof options.consumerIdentifier === "function") {
-      try { consumerIdentifier = options.consumerIdentifier({ request: req } as any); } catch {}
+      try {
+        const r = resolveConsumer(options.consumerIdentifier({ request: req } as any));
+        consumerIdentifier = r.identifier;
+        consumerName = r.name;
+        consumerGroup = r.group;
+      } catch {}
     } else if (typeof options.consumerIdentifier === "string") {
       consumerIdentifier = req.headers.get(options.consumerIdentifier.toLowerCase());
     }
@@ -84,6 +92,8 @@ export function sentrinelBunMiddleware(
         requestSize: parseInt(req.headers.get("content-length") || "0", 10),
         responseSize: 0,
         consumerIdentifier,
+        consumerName,
+        consumerGroup,
       });
 
       collector.recordError({
@@ -115,6 +125,8 @@ export function sentrinelBunMiddleware(
       requestSize: parseInt(req.headers.get("content-length") || "0", 10),
       responseSize: parseInt(response.headers.get("content-length") || "0", 10),
       consumerIdentifier,
+      consumerName,
+      consumerGroup,
     });
 
     // Record errors
