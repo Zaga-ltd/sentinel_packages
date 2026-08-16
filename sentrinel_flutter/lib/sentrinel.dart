@@ -72,6 +72,9 @@ class Sentrinel {
   static String? _sessionId;
   static DateTime? _sessionStartedAt;
   static String? _release;
+  /// Stable across launches — see [_resolveAnonymousId].
+  static String? _anonymousId;
+  static String? _userId;
 
   /// True once [init] has been called. Every other call is a no-op until then,
   /// so a missing init degrades to "no telemetry" rather than a crash.
@@ -137,8 +140,110 @@ class Sentrinel {
       _spool = null;
     }
 
+    // Product events need an identity or the server drops them, so this is
+    // resolved at init rather than lazily on the first track() — an event
+    // fired during startup would otherwise be the one that goes missing.
+    _anonymousId = _resolveAnonymousId();
+    _userId = null;
+    _collector!
+      ..anonymousId = _anonymousId
+      ..userId = null
+      ..release = release;
+
     _listenForIsolateErrors();
   }
+
+  /// The install's stable anonymous id, read from disk or minted once.
+  ///
+  /// Without persistence every launch would be a new person: retention flat,
+  /// funnels never completing across a restart, "daily actives" really meaning
+  /// "daily launches". When storage is unusable this falls back to a per-run
+  /// id — the events still arrive and still form funnels *within* a session,
+  /// which is better than dropping them.
+  static String _resolveAnonymousId() {
+    final existing = _spool?.readInstallId();
+    if (existing != null && existing.isNotEmpty) return existing;
+    final fresh = generateTraceId();
+    _spool?.writeInstallId(fresh);
+    return fresh;
+  }
+
+  // ─── Product analytics ────────────────────────────────────────────────────
+
+  /// Record that something happened: a funnel step, a feature used, a purchase.
+  ///
+  /// Deliberately not a log. A log line is written for a human to read while
+  /// debugging; an event is a row in a funnel, counted and grouped. Sending
+  /// events through [log] would either drown the funnel in debug noise or lose
+  /// the events among it.
+  ///
+  /// ```dart
+  /// Sentrinel.track('checkout_started', properties: {'cart_value': 42.0});
+  /// ```
+  ///
+  /// Keep [properties] small — dimensions you want to group by, not a payload.
+  /// The server caps them at 50 keys and 4KB; anything larger is a log.
+  static void track(
+    String name, {
+    Map<String, Object?>? properties,
+    String? traceId,
+    double? durationMs,
+  }) {
+    if (name.trim().isEmpty) return;
+    _collector?.recordEvent(EventRecord(
+      name: name,
+      kind: 'track',
+      properties: properties,
+      userId: _userId,
+      sessionId: _sessionId,
+      traceId: traceId,
+      durationMs: durationMs,
+    ));
+  }
+
+  /// Record that the user looked at a screen — the mobile pageview.
+  ///
+  /// The server normalises the name the same way it normalises a URL path, so
+  /// `Order/8f3a…` and `Order/9b21…` count as one screen rather than as two
+  /// screens seen once each. Pass the route name, not the resolved title.
+  static void screen(String name, {Map<String, Object?>? properties}) {
+    if (name.trim().isEmpty) return;
+    _collector?.recordEvent(EventRecord(
+      name: name,
+      kind: 'screen',
+      properties: properties,
+      userId: _userId,
+      sessionId: _sessionId,
+    ));
+  }
+
+  /// Attach a real identity to everything from here on.
+  ///
+  /// Call it when someone signs in. The anonymous id is sent alongside so the
+  /// server can stitch the two together: what they did *before* logging in
+  /// stays attached to the same person, which is the whole point of measuring
+  /// a signup funnel.
+  ///
+  /// Passing null signs them out — subsequent events revert to anonymous.
+  static void identify(String? userId, {Map<String, Object?>? properties}) {
+    _userId = (userId != null && userId.trim().isEmpty) ? null : userId;
+    _collector?.userId = _userId;
+
+    if (_userId == null) return;
+    _collector?.recordEvent(EventRecord(
+      name: 'identify',
+      kind: 'identify',
+      properties: properties,
+      userId: _userId,
+      sessionId: _sessionId,
+    ));
+  }
+
+  /// The id product events are attributed to before anyone signs in.
+  static String? get anonymousId => _anonymousId;
+
+  /// Who events are attributed to now, or null while anonymous.
+  static String? get currentUserId => _userId;
 
   /// Record that this run started, and notice if the last one never finished.
   static void _openSession(String appName, String env) {

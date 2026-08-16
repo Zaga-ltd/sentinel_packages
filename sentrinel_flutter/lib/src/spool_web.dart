@@ -28,6 +28,18 @@ class CrashSpool {
   /// code stays identical on every platform.
   CrashSpool(String directoryPath);
 
+  /// No filesystem, so no durable install id.
+  ///
+  /// Returning null means the caller generates a per-run id: on web a reload
+  /// therefore reads as a new anonymous person. That is the same trade already
+  /// made for sessions above, and the browser SDK — which does have storage —
+  /// is the right tool when web analytics matter.
+  String? readInstallId() => _installId;
+
+  void writeInstallId(String id) => _installId = id;
+
+  String? _installId;
+
   final List<SpooledRecord> _pending = [];
   Map<String, dynamic>? _session;
 

@@ -66,6 +66,8 @@ export interface ReplayOptions {
 export interface ReplayUpload {
   replayId: string;
   sessionId?: string;
+  /** Who was using the app. Resolved at upload time, not at start. */
+  consumerIdentifier?: string;
   seq: number;
   events: ReplayEvent[];
   startedAt: string;
@@ -115,7 +117,13 @@ function randomId(bytes = 16): string {
 export async function startReplay(
   options: ReplayOptions,
   send: (upload: ReplayUpload) => void,
-  getSessionId?: () => string | undefined
+  getSessionId?: () => string | undefined,
+  /**
+   * Read at upload time rather than captured at start: identify() usually runs
+   * after the recorder does, so asking early would attribute every recording
+   * to nobody.
+   */
+  getConsumer?: () => string | undefined
 ): Promise<ReplayController | null> {
   if (options.enabled === false) return null;
   if (typeof window === "undefined" || typeof document === "undefined") return null;
@@ -213,6 +221,7 @@ export async function startReplay(
     send({
       replayId,
       sessionId: getSessionId?.(),
+      consumerIdentifier: getConsumer?.(),
       seq: seq++,
       events,
       startedAt: new Date(startedAt).toISOString(),

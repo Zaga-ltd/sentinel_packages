@@ -264,6 +264,12 @@ export interface AppLogsPayload {
     category?: string;
     /** Structured fields — what you actually filter and group by. */
     attributes?: Record<string, unknown>;
+    /**
+     * Who the request belonged to, stamped by the plugin from the same
+     * `consumerIdentifier` the request row uses — so a user's log lines are
+     * findable without joining through a request that may have expired.
+     */
+    consumerIdentifier?: string | null;
     requestId?: string;
     /** Correlates the line to a distributed trace… */
     traceId?: string;

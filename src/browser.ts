@@ -1046,7 +1046,8 @@ class BrowserClient implements SentrinelBrowser {
       this.replay = await startReplay(
         { debug: this.opts.debug, ...this.opts.replay },
         (upload) => void this.sendReplay(upload),
-        () => this.session?.sessionId
+        () => this.session?.sessionId,
+        () => this.userId
       );
       if (this.replay) this.teardown.push(() => this.replay?.stop());
     } catch (err) {

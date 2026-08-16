@@ -255,3 +255,58 @@ class SpanRecord {
         },
       };
 }
+
+/// A product event — a screen view, a funnel step, a signup.
+///
+/// Separate from [LogRecord] on purpose. A log line is written for a human to
+/// read while debugging; an event is a row in a funnel, counted and grouped.
+/// Conflating them means either drowning the funnel in debug noise or losing
+/// the events among it.
+class EventRecord {
+  EventRecord({
+    required this.name,
+    this.kind = 'track',
+    this.properties,
+    this.userId,
+    this.sessionId,
+    this.traceId,
+    this.durationMs,
+    DateTime? timestamp,
+  }) : timestamp = timestamp ?? DateTime.now();
+
+  /// What happened: `checkout_started`, `Cart`, `signup_completed`.
+  final String name;
+
+  /// `track` · `screen` · `identify` · `session_start`.
+  ///
+  /// `screen` is the mobile equivalent of a pageview, and the server
+  /// normalises its name the same way — so `Order/8f3a…` and `Order/9b21…`
+  /// count as one screen rather than as two screens seen once each.
+  final String kind;
+
+  /// Dimensions to group and filter by. Kept small deliberately: the server
+  /// caps a payload at 50 keys and 4KB, and anything larger is a log, not an
+  /// event.
+  final Map<String, Object?>? properties;
+
+  /// Set once [Sentrinel.identify] has been called. Before that an event
+  /// carries only the anonymous id, and the server stitches the two together
+  /// when the identify arrives.
+  final String? userId;
+
+  final String? sessionId;
+  final String? traceId;
+  final double? durationMs;
+  final DateTime timestamp;
+
+  Map<String, dynamic> toJson() => {
+        'name': name,
+        'kind': kind,
+        'timestamp': timestamp.toUtc().toIso8601String(),
+        if (properties != null && properties!.isNotEmpty) 'properties': properties,
+        if (userId != null) 'userId': userId,
+        if (sessionId != null) 'sessionId': sessionId,
+        if (traceId != null) 'traceId': traceId,
+        if (durationMs != null) 'durationMs': durationMs,
+      };
+}

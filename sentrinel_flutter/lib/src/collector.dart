@@ -24,6 +24,11 @@ const int kMaxBufferedErrors = 200;
 const int kMaxBufferedLogs = 500;
 const int kMaxBufferedSpans = 500;
 
+/// The server refuses a batch over 500 events, so buffering more than that
+/// would only guarantee a 413. Matching the limit means the oldest are dropped
+/// here, where the reason is visible in [droppedRecords].
+const int kMaxBufferedEvents = 500;
+
 class SentrinelCollector {
   SentrinelCollector({
     required this.serverUrl,
@@ -45,6 +50,20 @@ class SentrinelCollector {
   final List<ErrorRecord> _errors = [];
   final List<LogRecord> _logs = [];
   final List<SpanRecord> _spans = [];
+  final List<EventRecord> _events = [];
+
+  /// Stable per-install id, set by [Sentrinel.init].
+  ///
+  /// Every event needs an identity or the server drops it — an event with
+  /// nobody attached cannot appear in a funnel, and bucketing it under a
+  /// synthetic id would read as one enormous user.
+  String? anonymousId;
+
+  /// Set by [Sentrinel.identify]; null until someone signs in.
+  String? userId;
+
+  /// Reported so events can be split by build the way sessions are.
+  String? release;
 
   Timer? _timer;
   bool _warned = false;
@@ -78,6 +97,10 @@ class SentrinelCollector {
 
   void recordLog(LogRecord record) {
     _push(_logs, record, kMaxBufferedLogs);
+  }
+
+  void recordEvent(EventRecord record) {
+    _push(_events, record, kMaxBufferedEvents);
   }
 
   /// Sessions are keyed, not appended: a session reported at start and again at
@@ -122,6 +145,7 @@ class SentrinelCollector {
       _spans.length +
       _errors.length +
       _logs.length +
+      _events.length +
       _sessions.length +
       _replayed.values.fold(0, (n, list) => n + list.length);
 
@@ -133,6 +157,7 @@ class SentrinelCollector {
     final spans = List<SpanRecord>.from(_spans);
     final errors = List<ErrorRecord>.from(_errors);
     final logs = List<LogRecord>.from(_logs);
+    final events = List<EventRecord>.from(_events);
     final replayed = {
       for (final e in _replayed.entries) e.key: List<Map<String, dynamic>>.from(e.value)
     };
@@ -141,6 +166,7 @@ class SentrinelCollector {
     _spans.clear();
     _errors.clear();
     _logs.clear();
+    _events.clear();
     _sessions.clear();
     _replayed.clear();
 
@@ -194,6 +220,21 @@ class SentrinelCollector {
         'durationMs': span.durationMs,
         'statusCode': span.statusCode == 'ERROR' ? 500 : 200,
         'spans': [span.toJson()],
+      }));
+    }
+
+    // Product events. The identity travels on the envelope rather than on each
+    // row: every event in one flush came from the same install and the same
+    // signed-in user, and repeating it per row would be pure payload.
+    if (events.isNotEmpty && (anonymousId != null || userId != null)) {
+      sends.add(_post('/api/ingest/events', {
+        'appName': appName,
+        'env': env,
+        if (anonymousId != null) 'anonymousId': anonymousId,
+        if (userId != null) 'userId': userId,
+        if (release != null) 'release': release,
+        'platform': 'mobile',
+        'events': events.map((e) => e.toJson()).toList(),
       }));
     }
 

@@ -40,6 +40,39 @@ class CrashSpool {
     if (!_dir.existsSync()) _dir.createSync(recursive: true);
   }
 
+  File get _installFile => File('${_dir.path}/install.id');
+
+  /// The stable per-install id used to attribute product events.
+  ///
+  /// It has to outlive the process or every launch reads as a brand-new
+  /// person: retention would be flat, funnels would never complete across a
+  /// restart, and "daily actives" would just be launches. Written once and
+  /// read thereafter.
+  ///
+  /// Returns null when the directory is unusable, and the caller falls back to
+  /// a per-run id — worse analytics, but never a crash in a monitoring SDK.
+  String? readInstallId() {
+    if (unusable) return null;
+    try {
+      _ensureDir();
+      if (!_installFile.existsSync()) return null;
+      final value = _installFile.readAsStringSync().trim();
+      return value.isEmpty ? null : value;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  void writeInstallId(String id) {
+    if (unusable) return;
+    try {
+      _ensureDir();
+      _installFile.writeAsStringSync(id, flush: true);
+    } catch (_) {
+      // Same policy as everything else here: degrade, never throw.
+    }
+  }
+
   /// Queue a record for delivery, synchronously.
   ///
   /// Called from crash handlers, where every asynchronous gap is a chance for

@@ -398,7 +398,16 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
           ? drainRequestLogs()
           : { logs: [], dropped: 0 };
         const hasErrorLogs = drained.logs.some((l) => l.level === "error");
-        if (drained.logs.length) collector.recordAppLogs(drained.logs);
+        // Stamp the caller onto every line written while handling this
+        // request, so "everything this user did" is one query rather than a
+        // join through a request row that may have aged out of retention.
+        if (drained.logs.length) {
+          collector.recordAppLogs(
+            consumerIdentifier
+              ? drained.logs.map((l) => ({ ...l, consumerIdentifier }))
+              : drained.logs
+          );
+        }
 
         // ─── Ship the trace ────────────────────────────────────────────────
         //
