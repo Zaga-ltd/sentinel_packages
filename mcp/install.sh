@@ -3,17 +3,20 @@
 #
 #   curl -fsSL https://sentrinel.dev/install-mcp.sh | bash
 #
+# Configure as you install, and Claude Code is registered for you — one line,
+# nothing left to paste:
+#
+#   curl -fsSL https://sentrinel.dev/install-mcp.sh | \
+#     SENTRINEL_API_KEY=snt_mcp_… \
+#     bash
+#
 # Downloads two single-file bundles — the MCP server and the CLI — and puts
 # `sentrinel-mcp` and `sentrinel` on your PATH. No clone, no `bun install`, no
 # sudo: everything lands under ~/.sentrinel and ~/.local/bin. Re-running
-# upgrades in place.
+# upgrades in place and leaves configuration alone.
 #
-# Then point an agent at it:
-#
-#   claude mcp add sentrinel \
-#     --env SENTRINEL_API_URL=https://api.sentrinel.dev \
-#     --env SENTRINEL_API_KEY=snt_mcp_… \
-#     -- sentrinel-mcp
+# The key is written to ~/.sentrinel/env (0600) and read by the commands
+# themselves, so it never appears in any agent's config or in `ps` output.
 #
 # The source lives in https://github.com/Zaga-ltd/sentinel_packages under mcp/.
 
@@ -23,6 +26,9 @@ VERSION="0.1.0"
 BASE_URL="${SENTRINEL_INSTALL_BASE:-https://sentrinel.dev}"
 INSTALL_DIR="${SENTRINEL_HOME:-$HOME/.sentrinel}"
 BIN_DIR="${SENTRINEL_BIN_DIR:-$HOME/.local/bin}"
+ENV_FILE="$INSTALL_DIR/env"
+API_URL="${SENTRINEL_API_URL:-https://api.sentrinel.dev}"
+API_KEY="${SENTRINEL_API_KEY:-}"
 
 say()  { printf '  %s\n' "$*"; }
 fail() { printf '\n  %s\n\n' "$*" >&2; exit 1; }
@@ -60,17 +66,44 @@ say "Downloading the MCP server and CLI…"
 fetch sentrinel-mcp.js
 fetch sentrinel-cli.js
 
-# Launchers rather than symlinks: the bundle needs `bun` to run it, and an
-# agent's config gets a bare command name it can spawn with no shell.
+# Launchers rather than symlinks: the bundle needs `bun` to run it, an agent's
+# config gets a bare command name it can spawn with no shell, and the key comes
+# from the env file below rather than from anybody's argv. Variables already in
+# the environment win, so a one-off `SENTRINEL_API_KEY=… sentrinel issues` still
+# works.
 launcher() {
   cat > "$BIN_DIR/$1" <<LAUNCH
 #!/usr/bin/env bash
+if [ -f "$ENV_FILE" ]; then
+  while IFS='=' read -r k v; do
+    case "\$k" in ''|'#'*) continue ;; esac
+    [ -n "\${!k:-}" ] || export "\$k=\$v"
+  done < "$ENV_FILE"
+fi
 exec "$BUN_BIN" run "$INSTALL_DIR/$2" "\$@"
 LAUNCH
   chmod 0755 "$BIN_DIR/$1"
 }
 launcher sentrinel-mcp sentrinel-mcp.js
 launcher sentrinel     sentrinel-cli.js
+
+# ─── Configuration ───────────────────────────────────────────────────────────
+#
+# Written only when a key was passed. A re-run without one keeps whatever is
+# already there — upgrading should never quietly unconfigure a working install.
+if [ -n "$API_KEY" ]; then
+  case "$API_KEY" in
+    snt_mcp_*|snt_mcprw_*) ;;
+    *) say "Note: $(printf %.12s "$API_KEY")… is not an AI agent key (snt_mcp_ / snt_mcprw_). The server will refuse it and say so." ;;
+  esac
+  umask 077
+  cat > "$ENV_FILE" <<ENV
+SENTRINEL_API_URL=$API_URL
+SENTRINEL_API_KEY=$API_KEY
+ENV
+  chmod 0600 "$ENV_FILE"
+  say "Key written to $ENV_FILE (0600)."
+fi
 
 printf '\n  Installed:\n'
 say "$BIN_DIR/sentrinel-mcp   the MCP server"
@@ -81,13 +114,45 @@ case ":$PATH:" in
   *) printf '\n  %s is not on your PATH. Add it:\n    export PATH="%s:$PATH"\n' "$BIN_DIR" "$BIN_DIR" ;;
 esac
 
-cat <<EOF
+# ─── Claude Code ─────────────────────────────────────────────────────────────
+#
+# If the CLI is here, do the registration too — the point of the one-liner is
+# that nothing is left to paste. No --env: the launcher reads the env file, so
+# the key stays out of the MCP config and out of `ps`.
+REGISTERED=""
+if [ -n "$API_KEY" ] && command -v claude >/dev/null 2>&1; then
+  claude mcp remove sentrinel --scope user >/dev/null 2>&1 || true
+  if claude mcp add sentrinel --scope user -- "$BIN_DIR/sentrinel-mcp" >/dev/null 2>&1; then
+    REGISTERED=yes
+    say "Registered with Claude Code (user scope)."
+  else
+    say "Could not register with Claude Code — add it yourself:"
+    say "  claude mcp add sentrinel -- $BIN_DIR/sentrinel-mcp"
+  fi
+fi
 
-  Point Claude Code at it (key from API Keys → Generate → AI agent):
+if [ -n "$REGISTERED" ]; then
+  cat <<EOF
 
-    claude mcp add sentrinel \\
-      --env SENTRINEL_API_URL=https://api.sentrinel.dev \\
-      --env SENTRINEL_API_KEY=snt_mcp_… \\
-      -- sentrinel-mcp
+  Done. In a Claude Code session:
+
+    Look at Sentrinel's top unresolved issue, find the cause in this repo, and fix it.
 
 EOF
+elif [ -n "$API_KEY" ]; then
+  cat <<EOF
+
+  Point an agent at it:
+
+    claude mcp add sentrinel -- sentrinel-mcp
+
+EOF
+else
+  cat <<EOF
+
+  Now give it a key (API Keys → Generate → AI agent) and register it:
+
+    curl -fsSL $BASE_URL/install-mcp.sh | SENTRINEL_API_KEY=snt_mcp_… bash
+
+EOF
+fi
