@@ -55,6 +55,17 @@ export {
 export { sentrinelExpressMiddleware } from "./express";
 export { sentrinelNextMiddleware } from "./next";
 export { createFlutterHeaderMap } from "./flutter";
+export {
+  count,
+  gauge,
+  histogram,
+  metric,
+  metricRegistry,
+  MetricRegistry,
+  type MetricKind,
+  type MetricLabels,
+  type MetricPoint,
+} from "./metrics";
 
 /**
  * Sentrinel Elysia Plugin

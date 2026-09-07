@@ -470,6 +470,9 @@ class Sentrinel {
       level: level,
       message: message,
       timestamp: DateTime.now(),
+      // Every signal names its owner, so a user's log lines are findable
+      // without joining through a request that may already have expired.
+      consumerIdentifier: _consumer,
       category: category,
       attributes: {..._context, ...?attributes},
     ));
@@ -559,6 +562,8 @@ class SentrinelHttpClient extends http.BaseClient {
         id: id,
         method: request.method,
         path: path,
+        route: routeTemplate(path),
+        host: request.url.host.isEmpty ? null : request.url.host,
         statusCode: response.statusCode,
         responseTime: watch.elapsedMicroseconds / 1000.0,
         timestamp: started,
@@ -621,6 +626,8 @@ class SentrinelHttpClient extends http.BaseClient {
         id: id,
         method: request.method,
         path: request.url.path.isEmpty ? '/' : request.url.path,
+        route: routeTemplate(request.url.path.isEmpty ? '/' : request.url.path),
+        host: request.url.host.isEmpty ? null : request.url.host,
         statusCode: 0,
         responseTime: watch.elapsedMicroseconds / 1000.0,
         timestamp: started,

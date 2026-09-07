@@ -29,7 +29,7 @@ const app = new Elysia()
       serverUrl: "http://localhost:3001",   // your Sentrinel API server
       appName: "my-api",
       env: "production",
-      apiKey: process.env.SENTINEL_API_KEY, // per-app ingest key
+      apiKey: process.env.SENTINEL_API_KEY, // a Server key (API Keys → Generate)
 
       consumerIdentifier: (ctx) => ctx.request.headers.get("x-consumer"),
 

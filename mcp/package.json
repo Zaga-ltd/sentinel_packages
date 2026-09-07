@@ -1,0 +1,19 @@
+{
+  "name": "@sentrinel/mcp",
+  "version": "0.1.0",
+  "description": "Sentrinel for coding agents — an MCP server and a CLI that hand Claude Code, Codex and friends your issues, logs and traces.",
+  "type": "module",
+  "bin": {
+    "sentrinel-mcp": "./src/server.ts",
+    "sentrinel": "./src/cli.ts"
+  },
+  "scripts": {
+    "mcp": "bun run src/server.ts",
+    "cli": "bun run src/cli.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.1.0"
+  }
+}

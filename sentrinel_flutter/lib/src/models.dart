@@ -8,6 +8,8 @@ library;
 /// One HTTP request the app made.
 class RequestRecord {
   RequestRecord({
+    this.route,
+    this.host,
     required this.id,
     required this.method,
     required this.path,
@@ -41,6 +43,19 @@ class RequestRecord {
   /// canonical wide event you can query on rather than a bare timing.
   final Map<String, Object?>? attributes;
 
+  /// The route template this call matched — `/orders/{id}`, not `/orders/8f3a`.
+  ///
+  /// `path` cannot serve both purposes. Grouping by it makes one endpoint per
+  /// distinct id, which is an unbounded endpoints table and an "active
+  /// endpoints" count in the hundreds for an app that calls thirty routes.
+  /// Derived automatically by replacing id-shaped segments; pass it explicitly
+  /// when the guess is wrong.
+  final String? route;
+
+  /// The host that was called. With one app talking to several services, "it
+  /// is slow" and "that service is slow" look identical without this.
+  final String? host;
+
   Map<String, dynamic> toJson() => {
         'id': id,
         'method': method,
@@ -50,6 +65,8 @@ class RequestRecord {
         'requestSize': requestSize,
         'responseSize': responseSize,
         'timestamp': timestamp.toUtc().toIso8601String(),
+        if (route != null) 'route': route,
+        if (host != null) 'host': host,
         if (consumerIdentifier != null) 'consumerIdentifier': consumerIdentifier,
         if (errorMessage != null) 'errorMessage': errorMessage,
         if (traceId != null) 'traceId': traceId,
@@ -172,6 +189,7 @@ class LogRecord {
     required this.level,
     required this.message,
     required this.timestamp,
+    this.consumerIdentifier,
     this.category,
     this.attributes,
     this.requestId,
@@ -183,6 +201,15 @@ class LogRecord {
   final String level;
   final String message;
   final DateTime timestamp;
+
+  /// Whose activity produced this line.
+  ///
+  /// Stored on the row rather than resolved through [requestId] at read time:
+  /// logs and requests expire on separate clocks, and a line whose request has
+  /// aged out would otherwise lose its owner entirely — so "everything this
+  /// user did" would quietly return a subset.
+  final String? consumerIdentifier;
+
   final String? category;
   final Map<String, Object?>? attributes;
   final String? requestId;
@@ -193,6 +220,7 @@ class LogRecord {
         'level': level,
         'message': message,
         'timestamp': timestamp.toUtc().toIso8601String(),
+        if (consumerIdentifier != null) 'consumerIdentifier': consumerIdentifier,
         if (category != null) 'category': category,
         if (attributes != null && attributes!.isNotEmpty)
           'attributes': attributes,
@@ -309,4 +337,54 @@ class EventRecord {
         if (traceId != null) 'traceId': traceId,
         if (durationMs != null) 'durationMs': durationMs,
       };
+}
+
+/// Collapse the ids out of a URL path so it groups as one endpoint.
+///
+/// A mobile app calls `/orders/8f3a…` and `/orders/9b21…`; the server keys
+/// endpoints on `route || path`, so without this each id becomes an endpoint
+/// of its own — an unbounded endpoints table, and an "active endpoints" count
+/// in the hundreds for an app that calls thirty routes.
+///
+/// The rules are deliberately conservative: a segment is replaced only when it
+/// is *obviously* an identifier. Collapsing `/v1/` into `/{id}/` would be far
+/// worse than leaving a stray id in place, because it merges endpoints that
+/// have nothing to do with each other.
+String routeTemplate(String path) {
+  if (path.isEmpty) return '/';
+
+  final segments = path.split('/');
+  for (var i = 0; i < segments.length; i++) {
+    final seg = segments[i];
+    if (seg.isEmpty) continue;
+    if (_looksLikeId(seg)) segments[i] = '{id}';
+  }
+  final out = segments.join('/');
+  return out.isEmpty ? '/' : out;
+}
+
+final _uuid = RegExp(
+    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$');
+final _digits = RegExp(r'^\d+$');
+// 8+ is where short SHAs and compact ids live. Shorter than that and the false
+// positives start costing more than the collapsing saves.
+final _hex = RegExp(r'^[0-9a-fA-F]{8,}$');
+// Mixed-case alphanumerics of some length: ULIDs, nanoids, Stripe-style ids.
+final _opaque = RegExp(r'^[A-Za-z0-9_-]{16,}$');
+final _hasDigit = RegExp(r'\d');
+
+bool _looksLikeId(String seg) {
+  if (_uuid.hasMatch(seg)) return true;
+  if (_digits.hasMatch(seg)) return true;
+
+  // Every remaining rule insists on a digit, and that is what keeps ordinary
+  // words safe. `facade`, `decade` and `defaced` are all valid hex; `orders`
+  // and `notifications` are long enough to look opaque. Merging any of those
+  // into `{id}` would fuse unrelated endpoints — far worse than leaving one
+  // stray id uncollapsed.
+  if (!_hasDigit.hasMatch(seg)) return false;
+
+  if (_hex.hasMatch(seg)) return true;
+  if (_opaque.hasMatch(seg)) return true;
+  return false;
 }

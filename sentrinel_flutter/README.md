@@ -26,6 +26,8 @@ void main() {
     serverUrl: 'https://api.sentrinel.dev',
     appName: 'mobile-app',
     env: 'prod',
+    // A Mobile app key: it ships in the bundle, so it is issued to send only
+    // what a phone sends — a leaked one cannot post a replay or read anything.
     apiKey: const String.fromEnvironment('SENTRINEL_API_KEY'),
     consumerIdentifier: 'ios_app',
   );

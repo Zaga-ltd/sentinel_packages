@@ -9,6 +9,7 @@ import type {
   AppLogsPayload,
 } from "./types";
 import { RetryQueue } from "./retry";
+import { metricRegistry } from "./metrics";
 import { hostname } from "node:os";
 
 /**
@@ -240,6 +241,21 @@ export class MetricsCollector {
             })
           );
         }
+      }
+
+      // Custom metrics ride the same flush. Drained here rather than buffered
+      // per-record because the registry folds increments in memory — see
+      // metrics.ts — so this is one row per series, not one per call.
+      const points = metricRegistry().drain();
+      if (points.length) {
+        promises.push(
+          this.sendToServer("/api/ingest/custom-metrics", {
+            appName: this.options.appName,
+            env: this.options.env || "dev",
+            version: this.options.version,
+            metrics: points,
+          })
+        );
       }
 
       await Promise.allSettled(promises);
