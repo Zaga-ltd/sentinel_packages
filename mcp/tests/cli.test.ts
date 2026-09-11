@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { parseArgs, run } from "../src/cli";
+import { planFromArgs } from "../src/skill";
 import type { SentrinelClient } from "../src/client";
 
 function fakeClient() {
@@ -57,5 +58,19 @@ describe("run", () => {
     await expect(run(["issue"], client)).rejects.toThrow(/usage: sentrinel issue/);
     await expect(run(["frobnicate"], client)).rejects.toThrow(/unknown command/);
     expect(await run([], client)).toContain("sentrinel issues");
+  });
+});
+
+// `sentrinel skill install` — the word after `skill` lands in parseArgs's
+// `command`, not in `positional`, and reading the wrong one silently turned
+// every install into a print.
+describe("skill arguments", () => {
+  test("puts the subcommand where the caller looks for it", () => {
+    const { command, positional } = parseArgs(["install", "--cursor"]);
+    expect(command).toBe("install");
+    expect(positional).toEqual([]);
+    expect(planFromArgs(command ? [command] : [], { cursor: true }, { home: "/h", cwd: "/r" }).files[0].path).toBe(
+      "/r/.cursor/rules/sentrinel.mdc"
+    );
   });
 });

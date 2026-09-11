@@ -13,12 +13,18 @@
 //   sentrinel trace <id>
 //   sentrinel request <id>
 //   sentrinel resolve|ignore|reopen <id>        (needs a may-resolve agent key)
+//   sentrinel skill [install [--cursor|--agents|--dir P]]
 //   --json on any command prints the raw API response instead.
 //
 // The key is read from SENTRINEL_API_KEY. There is deliberately no --key flag:
 // argv is visible to every process on the machine.
 
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
+import { homedir } from "node:os";
+
 import { configFromEnv, SentrinelClient } from "./client";
+import { mergeBlock, planFromArgs } from "./skill";
 import {
   issuesToMarkdown,
   issueToMarkdown,
@@ -45,6 +51,13 @@ const USAGE = `sentrinel — Sentrinel for coding agents
   sentrinel dbhealth <db-id> [--period 3600]    connections, deadlocks, temp bytes
   sentrinel resolve|ignore|reopen <id>      needs an "AI agent — may resolve issues" key
   --json                                    raw API response
+
+  sentrinel skill                           print the agent skill (how to use all of this)
+  sentrinel skill --all                     with its reference pages
+  sentrinel skill install                   ~/.claude/skills/sentrinel/   Claude Code & Desktop
+  sentrinel skill install --cursor          .cursor/rules/sentrinel.mdc   Cursor
+  sentrinel skill install --agents          ./AGENTS.md                   Codex, Copilot, Amp
+  sentrinel skill install --dir <path>      anywhere else
 
 Environment: SENTRINEL_API_URL, SENTRINEL_API_KEY (an AI agent key: snt_mcp_… or snt_mcprw_…)`;
 
@@ -173,6 +186,26 @@ if (import.meta.main) {
       process.stdout.write(USAGE + "\n");
       process.exit(0);
     }
+    // The skill needs no credentials — it is documentation, and an agent that
+    // cannot read it yet is exactly the one that needs it.
+    if (first === "skill") {
+      // parseArgs lifts the first positional into `command`, so the word after
+      // `skill` arrives there, not in `positional`.
+      const { command, positional, flags } = parseArgs(process.argv.slice(3));
+      const words = command ? [command, ...positional] : positional;
+      const { print, files } = planFromArgs(words, flags, { home: homedir(), cwd: process.cwd() });
+      for (const f of files) {
+        await mkdir(dirname(f.path), { recursive: true });
+        // AGENTS.md belongs to whoever wrote it; merge into our own block.
+        const content = f.path.endsWith("AGENTS.md")
+          ? mergeBlock(await readFile(f.path, "utf8").catch(() => ""), f.content)
+          : f.content;
+        await writeFile(f.path, content);
+      }
+      process.stdout.write(print + "\n");
+      process.exit(0);
+    }
+
     const client = new SentrinelClient(configFromEnv());
     const text = await run(process.argv.slice(2), client);
     process.stdout.write(text + "\n");

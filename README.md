@@ -1,6 +1,7 @@
 # Sentrinel packages
 
-The public SDKs for [Sentrinel](https://sentrinel.dev). Four packages, one repo.
+The public SDKs for [Sentrinel](https://sentrinel.dev). Four packages and the
+agent skill, one repo.
 
 | Package | For | Install |
 |---|---|---|
@@ -8,6 +9,7 @@ The public SDKs for [Sentrinel](https://sentrinel.dev). Four packages, one repo.
 | [`sentrinel_django/`](sentrinel_django) | Django 3.1 – 5.2 | `pip install "git+https://github.com/Zaga-ltd/sentinel_packages.git#subdirectory=sentrinel_django"` |
 | [`sentrinel_flutter_integration/`](sentrinel_flutter_integration) | Flutter apps | a `git:` dependency — see below |
 | [`mcp/`](mcp) | Claude Code, Codex and other agents | `curl -fsSL https://sentrinel.dev/install-mcp.sh \| bash` |
+| [`mcp/skill/`](mcp/skill) | the agent skill — how to use those tools well | `sentrinel skill install [--cursor\|--agents]` |
 
 **None of these are on npm, PyPI or pub.dev yet.** Every command above installs
 from this repository, which is why each one names it.
@@ -42,7 +44,8 @@ Documentation lives at **[docs.sentrinel.dev](https://docs.sentrinel.dev)** —
 [JavaScript](https://docs.sentrinel.dev/reference/plugin/),
 [Django](https://docs.sentrinel.dev/reference/django/),
 [mobile](https://docs.sentrinel.dev/reference/mobile/),
-[coding agents](https://docs.sentrinel.dev/reference/mcp/).
+[coding agents](https://docs.sentrinel.dev/reference/mcp/),
+[the agent skill](https://docs.sentrinel.dev/reference/skill/).
 
 ---
 

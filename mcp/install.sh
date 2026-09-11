@@ -18,6 +18,10 @@
 # The key is written to ~/.sentrinel/env (0600) and read by the commands
 # themselves, so it never appears in any agent's config or in `ps` output.
 #
+# It also installs the agent skill — how to use these tools well — into
+# ~/.claude/skills when Claude is present. SENTRINEL_SKILL=0 skips that; every
+# other harness is `sentrinel skill install --cursor|--agents|--dir P`.
+#
 # The source lives in https://github.com/Zaga-ltd/sentinel_packages under mcp/.
 
 set -euo pipefail
@@ -150,12 +154,33 @@ if [ -n "$API_KEY" ] && command -v claude >/dev/null 2>&1; then
   fi
 fi
 
+# ─── The skill ───────────────────────────────────────────────────────────────
+#
+# Tools without a skill get used badly: an agent that can call get_issue but
+# does not know to follow it to the captured request stops at the stack trace,
+# which is the part the developer already had. Installed where Claude looks
+# when Claude is present; every other harness is one command away and the
+# output below says which.
+#
+# SENTRINEL_SKILL=0 skips it, for anyone who manages their own skills.
+if [ "${SENTRINEL_SKILL:-1}" != "0" ] && [ -d "$HOME/.claude" ]; then
+  "$BIN_DIR/sentrinel" skill install >/dev/null 2>&1 \
+    && say "Skill installed to ~/.claude/skills/sentrinel/." \
+    || say "Could not install the skill — run: sentrinel skill install"
+fi
+
 if [ -n "$REGISTERED" ]; then
   cat <<EOF
 
   Done. In a Claude Code session:
 
     Look at Sentrinel's top unresolved issue, find the cause in this repo, and fix it.
+
+  Using another agent? The skill goes wherever it reads from:
+
+    sentrinel skill install --cursor    .cursor/rules/sentrinel.mdc
+    sentrinel skill install --agents    ./AGENTS.md   (Codex, Copilot, Amp)
+    sentrinel skill                     print it, for anything else
 
 EOF
 elif [ -n "$API_KEY" ]; then
