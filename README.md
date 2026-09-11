@@ -6,11 +6,37 @@ The public SDKs for [Sentrinel](https://sentrinel.dev). Four packages, one repo.
 |---|---|---|
 | [`src/`](src) | Elysia, Express, Next.js, Bun, any JS backend | `bun add "@sentrinel/plugin@github:Zaga-ltd/sentinel_packages"` |
 | [`sentrinel_django/`](sentrinel_django) | Django 3.1 – 5.2 | `pip install "git+https://github.com/Zaga-ltd/sentinel_packages.git#subdirectory=sentrinel_django"` |
-| [`sentrinel_flutter/`](sentrinel_flutter) | Flutter and Dart apps | a `git:` dependency on this repo, `path: sentrinel_flutter` |
+| [`sentrinel_flutter_integration/`](sentrinel_flutter_integration) | Flutter apps | a `git:` dependency — see below |
 | [`mcp/`](mcp) | Claude Code, Codex and other agents | `curl -fsSL https://sentrinel.dev/install-mcp.sh \| bash` |
 
 **None of these are on npm, PyPI or pub.dev yet.** Every command above installs
 from this repository, which is why each one names it.
+
+### Flutter
+
+The directory names and the package names are not the same, so copy these
+rather than guessing: pub matches the dependency key against the package's own
+`name:`, and a mismatch fails to resolve.
+
+A **Flutter app** wants the integration package — it pulls the core in with it:
+
+```yaml
+dependencies:
+  sentrinel_flutter:
+    git:
+      url: https://github.com/Zaga-ltd/sentinel_packages
+      path: sentrinel_flutter_integration
+```
+
+A **Dart CLI or server** wants the core alone, which has no Flutter dependency:
+
+```yaml
+dependencies:
+  sentrinel:
+    git:
+      url: https://github.com/Zaga-ltd/sentinel_packages.git
+      path: sentrinel_flutter
+```
 
 Documentation lives at **[docs.sentrinel.dev](https://docs.sentrinel.dev)** —
 [JavaScript](https://docs.sentrinel.dev/reference/plugin/),
