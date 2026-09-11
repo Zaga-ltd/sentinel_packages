@@ -411,3 +411,202 @@ class TestTracePropagation:
 
         assert outgoing_headers({"a": "b"}) == {"a": "b"}
         assert current_trace()["trace_id"] is None
+
+
+class TestSpans:
+    """A request row says a page took 900ms. A trace says which call it was."""
+
+    def test_spans_ship_as_a_trace_under_the_request(self, build, sent):
+        from django.http import HttpResponse
+
+        from sentrinel_django import span
+
+        def view(request):
+            with span("db.query", {"table": "orders"}):
+                pass
+            return HttpResponse("ok")
+
+        mw = build(view)
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+
+        trace = sent.payload("/api/ingest/traces")
+        assert trace["appName"] == "orders"
+        names = [s["name"] for s in trace["spans"]]
+        assert "db.query" in names
+        # The server span is first and is the parent of the work it did.
+        root = trace["spans"][0]
+        child = next(s for s in trace["spans"] if s["name"] == "db.query")
+        assert root["kind"] == "SERVER"
+        assert child["parentId"] == root["id"]
+        assert trace["requestLogId"] == sent.rows("/api/ingest/requests", "requests")[0]["id"]
+
+    def test_nesting_follows_the_code(self, build, sent):
+        from django.http import HttpResponse
+
+        from sentrinel_django import span
+
+        def view(request):
+            with span("outer"):
+                with span("inner"):
+                    pass
+            return HttpResponse("ok")
+
+        mw = build(view)
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+
+        spans = {s["name"]: s for s in sent.payload("/api/ingest/traces")["spans"]}
+        assert spans["inner"]["parentId"] == spans["outer"]["id"]
+
+    def test_a_raising_span_is_marked_and_the_error_still_propagates(self, build, sent):
+        from django.http import HttpResponse
+
+        from sentrinel_django import span
+
+        def view(request):
+            try:
+                with span("risky"):
+                    raise ValueError("nope")
+            except ValueError:
+                pass
+            return HttpResponse("ok")
+
+        mw = build(view)
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+
+        risky = next(s for s in sent.payload("/api/ingest/traces")["spans"] if s["name"] == "risky")
+        assert risky["statusCode"] == "ERROR"
+        assert "ValueError" in risky["statusMessage"]
+
+    def test_no_spans_means_no_trace_row(self, build, sent):
+        # A trace holding only its own server span repeats the request row.
+        mw = build()
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+        assert sent.payload("/api/ingest/traces") is None
+
+    def test_the_traced_decorator_names_the_function(self, build, sent):
+        from django.http import HttpResponse
+
+        from sentrinel_django import traced
+
+        @traced()
+        def price_it():
+            return 1
+
+        def view(request):
+            price_it()
+            return HttpResponse("ok")
+
+        mw = build(view)
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+        assert any("price_it" in s["name"] for s in sent.payload("/api/ingest/traces")["spans"])
+
+    def test_a_span_outside_a_request_is_inert_not_an_error(self):
+        from sentrinel_django import span
+
+        with span("orphan") as s:
+            s["attributes"]["x"] = 1  # must not raise
+
+    def test_the_span_tree_joins_the_incoming_trace(self, build, sent):
+        from django.http import HttpResponse
+
+        from sentrinel_django import span
+
+        def view(request):
+            with span("work"):
+                pass
+            return HttpResponse("ok")
+
+        mw = build(view)
+        mw(rf.get("/ok/", HTTP_TRACEPARENT="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"))
+        mw.collector.flush()
+
+        trace = sent.payload("/api/ingest/traces")
+        assert trace["traceId"] == "4bf92f3577b34da6a3ce929d0e0e4736"
+        # The phone's span is the parent of our server span, so one waterfall.
+        assert trace["spans"][0]["parentId"] == "00f067aa0ba902b7"
+
+
+class TestResourceUsage:
+    def test_cpu_and_memory_ride_the_metrics_payload(self, build, sent):
+        mw = build()
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+        usage = sent.payload("/api/ingest/metrics").get("resourceUsage")
+        # Exactly the field names the ingest route reads — inventing clearer
+        # ones produced rows of nulls that looked like the feature was off.
+        assert usage and usage["memoryRss"] > 0
+        assert usage["cpuUsage"] >= 0
+        # Named, because gunicorn runs several workers and their numbers must
+        # not average into something that describes none of them.
+        assert usage["instanceId"]
+
+
+class TestTunnel:
+    """The browser SDK holds no key; this forwards its batches."""
+
+    def _post(self, body):
+        import json as _json
+
+        return rf.post("/api/_sentrinel", data=_json.dumps(body), content_type="application/json")
+
+    def test_a_batch_is_forwarded_to_the_right_ingest_paths(self, build, sent):
+        from sentrinel_django import sentrinel_tunnel
+
+        build()  # installs the stubbed collector
+        res = sentrinel_tunnel(self._post({"errors": [{"m": 1}], "requests": [{"p": "/"}]}))
+        assert res.status_code == 200
+
+        paths = [p for p, _ in sent.posts]
+        assert "/api/ingest/errors" in paths and "/api/ingest/requests" in paths
+
+    def test_the_app_name_comes_from_settings_not_the_batch(self, build, sent):
+        from sentrinel_django import sentrinel_tunnel
+
+        build()
+        # Anyone who finds the URL must not be able to write into another app.
+        sentrinel_tunnel(self._post({"errors": [{"m": 1}], "appName": "someone-elses-app", "env": "prod"}))
+        body = sent.payload("/api/ingest/errors")
+        assert body["appName"] == "orders"
+
+    def test_junk_is_refused(self, build):
+        from sentrinel_django import sentrinel_tunnel
+
+        build()
+        assert sentrinel_tunnel(rf.get("/api/_sentrinel")).status_code == 405
+        assert sentrinel_tunnel(rf.post("/api/_sentrinel", data=b"not json", content_type="application/json")).status_code == 400
+
+
+class TestOutbound:
+    def test_a_call_becomes_a_span_and_carries_the_trace(self, build, sent):
+        from django.http import HttpResponse
+
+        from sentrinel_django import SentrinelSession
+
+        seen = {}
+
+        class FakeSession:
+            def request(self, method, url, **kw):
+                seen["headers"] = kw.get("headers") or {}
+                seen["method"] = method
+                return type("R", (), {"status_code": 200})()
+
+        def view(request):
+            SentrinelSession(FakeSession()).get("https://api.example.com/rates?key=secret")
+            return HttpResponse("ok")
+
+        mw = build(view)
+        mw(rf.get("/ok/", HTTP_TRACEPARENT="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"))
+        mw.collector.flush()
+
+        # The downstream service is handed the same trace.
+        assert seen["headers"]["traceparent"].startswith("00-4bf92f3577b34da6a3ce929d0e0e4736-")
+        span = next(s for s in sent.payload("/api/ingest/traces")["spans"] if s["kind"] == "CLIENT")
+        assert span["name"] == "GET api.example.com/rates"
+        # The query string carried a secret and is not in the name or the url.
+        assert "secret" not in json.dumps(sent.posts)
+        assert span["attributes"]["http.status_code"] == 200

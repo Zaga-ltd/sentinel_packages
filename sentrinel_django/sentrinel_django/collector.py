@@ -54,6 +54,7 @@ class Collector:
         self._requests: list[dict[str, Any]] = []
         self._logs: list[dict[str, Any]] = []
         self._errors: list[dict[str, Any]] = []
+        self._traces: list[dict[str, Any]] = []
         self._endpoints: dict[tuple[str, str], dict[str, Any]] = {}
         self._consumers: dict[tuple[str, str, str], dict[str, Any]] = {}
         self._dropped = 0
@@ -73,6 +74,11 @@ class Collector:
     def record_error(self, row: dict[str, Any]) -> None:
         with self._lock:
             self._append(self._errors, row)
+        self._ensure_started()
+
+    def record_trace(self, trace: dict[str, Any]) -> None:
+        with self._lock:
+            self._append(self._traces, trace)
         self._ensure_started()
 
     def record_logs(self, rows: list[dict[str, Any]]) -> None:
@@ -211,6 +217,7 @@ class Collector:
             requests, self._requests = self._requests, []
             logs, self._logs = self._logs, []
             errors, self._errors = self._errors, []
+            traces, self._traces = self._traces, []
             endpoints, self._endpoints = self._endpoints, {}
             consumers, self._consumers = self._consumers, {}
             retry, self._retry = self._retry, []
@@ -230,6 +237,10 @@ class Collector:
             self._post("/api/ingest/logs", self._envelope(logs=logs))
         if errors:
             self._post("/api/ingest/errors", self._envelope(errors=errors))
+
+        # One trace per request, and the route takes one at a time.
+        for trace in traces:
+            self._post("/api/ingest/traces", self._envelope(**trace))
 
         # Custom metrics ride the same flush. Drained here rather than buffered
         # per call because the registry folds increments in memory — this is one
@@ -271,6 +282,9 @@ class Collector:
         )
         if self.config.version:
             payload["version"] = self.config.version
+        usage = _resource_usage()
+        if usage:
+            payload["resourceUsage"] = usage
         return payload
 
     def _post(self, path: str, payload: dict[str, Any], attempt: int = 0) -> None:
@@ -325,6 +339,73 @@ class Collector:
     def _debug(self, *parts: Any) -> None:
         if self.config.debug:
             print("[sentrinel]", *parts, flush=True)
+
+
+def _resource_usage() -> dict[str, Any] | None:
+    """CPU and memory for this worker, in the shape the API stores.
+
+    The field names are the Node plugin's — `cpuUsage`, `memoryRss` — because
+    the API reads those and one dashboard renders both. Inventing clearer names
+    here would have produced rows of nulls that look like the feature is off.
+
+    `resource` is POSIX-only, and neither figure is worth a dependency, so this
+    reports what the platform will say and returns None otherwise. The instance
+    id matters because gunicorn runs several workers: without it their numbers
+    average into something that describes none of them.
+    """
+    try:
+        import resource as _resource
+    except ImportError:
+        return None
+
+    try:
+        usage = _resource.getrusage(_resource.RUSAGE_SELF)
+    except Exception:
+        return None
+
+    global _last_cpu_seconds, _last_cpu_at
+    cpu_seconds = usage.ru_utime + usage.ru_stime
+    now = time.monotonic()
+
+    # A percentage over the window since the last flush, not since boot: the
+    # lifetime average of a process that was busy an hour ago and idle now
+    # describes neither moment.
+    percent = 0.0
+    if _last_cpu_at is not None:
+        elapsed = now - _last_cpu_at
+        if elapsed > 0:
+            percent = max(0.0, min(100.0 * os.cpu_count() if os.cpu_count() else 100.0,
+                                   ((cpu_seconds - _last_cpu_seconds) / elapsed) * 100.0))
+    _last_cpu_seconds, _last_cpu_at = cpu_seconds, now
+
+    return {
+        "instanceId": INSTANCE_ID,
+        "cpuUsage": round(percent, 2),
+        "memoryRss": _rss_bytes(usage),
+    }
+
+
+def _rss_bytes(usage: Any) -> int:
+    """Resident memory now, falling back to the peak when that is all there is.
+
+    /proc gives the current figure on Linux. Elsewhere `ru_maxrss` is the high
+    water mark — not the same number, but the only one available without a
+    dependency. Its unit is the portability trap: kilobytes on Linux, bytes on
+    macOS, a factor of 1024 in something people read off a chart.
+    """
+    try:
+        with open("/proc/self/statm", "r") as fh:
+            pages = int(fh.read().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE")
+    except Exception:
+        pass
+    import sys
+
+    return int(usage.ru_maxrss if sys.platform == "darwin" else usage.ru_maxrss * 1024)
+
+
+_last_cpu_seconds: float = 0.0
+_last_cpu_at: float | None = None
 
 
 def _now_iso() -> str:

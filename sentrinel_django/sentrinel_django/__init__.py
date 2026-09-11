@@ -25,7 +25,10 @@ from .context import add_context, set_consumer
 from .logs import SentrinelLogHandler
 from .metrics import count, gauge, histogram, registry
 from .middleware import SentrinelMiddleware
+from .outbound import SentrinelSession, trace_headers
 from .trace import parse_traceparent, traceparent_for
+from .tracing import current_span_id, span, traced
+from .tunnel import sentrinel_tunnel
 
 __all__ = [
     "SentrinelMiddleware",
@@ -33,8 +36,14 @@ __all__ = [
     "add_context",
     "set_consumer",
     "capture_exception",
+    "SentrinelSession",
     "count",
+    "current_span_id",
     "current_trace",
+    "sentrinel_tunnel",
+    "span",
+    "trace_headers",
+    "traced",
     "outgoing_headers",
     "gauge",
     "histogram",

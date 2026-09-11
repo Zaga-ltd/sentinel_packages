@@ -101,6 +101,7 @@ class SentrinelMiddleware:
             parent_span_id=incoming.parent_span_id if incoming else None,
         )
         started = time.perf_counter()
+        state["started_iso"] = _now_iso()
         request_body = self._read_request_body(request)
 
         try:
@@ -269,6 +270,65 @@ class SentrinelMiddleware:
             row["traceId"] = state["trace_id"]
 
         self.collector.record_request(row)
+        self._record_trace(state, method, route, status, elapsed_ms, started)
+
+    def _record_trace(
+        self,
+        state: dict[str, Any],
+        method: str,
+        route: str,
+        status: int,
+        elapsed_ms: float,
+        started: float,
+    ) -> None:
+        """Ship the request's span tree, if it recorded any.
+
+        Only when there are child spans: a trace holding nothing but its own
+        server span repeats what the request row already says, and would double
+        the rows for every request in exchange for nothing.
+        """
+        spans = state.get("spans") or []
+        if not spans:
+            return
+
+        root_id = state.get("span_id")
+        start_iso = state.get("started_iso") or _now_iso()
+        end_iso = _now_iso()
+        root = {
+            "id": root_id,
+            "traceId": state.get("trace_id"),
+            # The caller's span when one sent a traceparent, so the phone's
+            # request and this server's work share a waterfall.
+            "parentId": state.get("parent_span_id"),
+            "name": f"{method} {route}",
+            "kind": "SERVER",
+            "startTime": start_iso,
+            "endTime": end_iso,
+            "durationMs": round(elapsed_ms, 3),
+            "statusCode": "ERROR" if status >= 500 else "OK",
+            "attributes": {
+                "http.method": method,
+                "http.route": route,
+                "http.status_code": status,
+                **(state.get("attributes") or {}),
+            },
+        }
+        dropped = state.get("spans_dropped")
+        if dropped:
+            root["attributes"]["sentrinel.spans_dropped"] = dropped
+
+        self.collector.record_trace(
+            {
+                "traceId": state.get("trace_id"),
+                "requestLogId": state.get("request_id"),
+                "name": f"{method} {route}",
+                "startTime": start_iso,
+                "endTime": end_iso,
+                "durationMs": round(elapsed_ms, 3),
+                "statusCode": status,
+                "spans": [root, *spans],
+            }
+        )
 
 
 def _path(request: Any) -> str:
