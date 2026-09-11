@@ -31,6 +31,19 @@ export function body(main: string = SKILL_FILES["SKILL.md"]): string {
   return main.startsWith("---") ? main.slice(main.indexOf("\n---", 3) + 4).trimStart() : main;
 }
 
+/**
+ * The single-file forms travel without their references/ directory, so a
+ * relative link in them points at nothing — and an agent that follows it
+ * either wastes a read or, worse, describes a file it never opened. Rewrite
+ * those links to the published copies, which are the same text.
+ */
+export function absolutize(md: string): string {
+  return md.replace(
+    /\]\(references\/([a-z-]+)\.md\)/g,
+    (_m, page: string) => `](https://github.com/Zaga-ltd/sentinel_packages/blob/main/mcp/skill/references/${page}.md)`
+  );
+}
+
 export interface PlannedFile {
   path: string;
   content: string;
@@ -63,7 +76,7 @@ export function agentsBlock(): string {
   return [
     "## Sentrinel (production telemetry)",
     "",
-    body().replace(/^# Sentrinel\n+/, ""),
+    absolutize(body()).replace(/^# Sentrinel\n+/, ""),
   ].join("\n");
 }
 
@@ -75,7 +88,7 @@ export function cursorRule(): string {
     "alwaysApply: false",
     "---",
     "",
-    body(),
+    absolutize(body()),
   ].join("\n");
 }
 

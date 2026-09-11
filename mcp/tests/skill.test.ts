@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 
 import { collect, render } from "../scripts/gen-skill";
 import { SKILL_FILES } from "../src/skill-content";
-import { agentsBlock, body, cursorRule, description, mergeBlock, on, plan, planFromArgs } from "../src/skill";
+import { absolutize, agentsBlock, body, cursorRule, description, mergeBlock, on, plan, planFromArgs } from "../src/skill";
 
 const env = { home: "/home/dev", cwd: "/repo" };
 const opts = { install: false, all: false, cursor: false, agents: false, ...env };
@@ -137,5 +137,27 @@ describe("flags", () => {
   it("routes --cursor=1 to the Cursor rule", () => {
     const p = planFromArgs(["install"], { cursor: "1" }, { home: "/h", cwd: "/r" });
     expect(p.files[0].path).toBe("/r/.cursor/rules/sentrinel.mdc");
+  });
+});
+
+// A relative link to references/ is correct inside the installed skill folder
+// and dangling in every single-file form, where those files do not travel.
+describe("links in the single-file forms", () => {
+  it("rewrites relative reference links to the published copies", () => {
+    expect(absolutize("see [cli](references/cli.md) now")).toBe(
+      "see [cli](https://github.com/Zaga-ltd/sentinel_packages/blob/main/mcp/skill/references/cli.md) now"
+    );
+  });
+
+  it("leaves no relative reference link in the Cursor rule or the AGENTS block", () => {
+    for (const form of [cursorRule(), agentsBlock()]) {
+      expect(form).not.toMatch(/\]\(references\//);
+      expect(form).toContain("skill/references/cli.md");
+    }
+  });
+
+  it("keeps them relative in the installed skill, where the files are real", () => {
+    const [main] = plan({ ...opts, install: true }).files;
+    expect(main.content).toContain("](references/cli.md)");
   });
 });

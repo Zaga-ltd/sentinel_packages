@@ -45,19 +45,35 @@ own logs — so never stop at the trace when an issue names a request.
    - `occurrences` — the noisiest
    - `users` — the widest blast radius; usually the one worth fixing first
    - `first_seen` — what has been broken longest
-2. `get_issue <id>` — stack trace, culprit, how many users, the release it
-   started in, and **the ids of the request and trace behind the latest
-   occurrence**.
-3. `get_request <request-id>` — headers, body, response, error. This is the
-   input that broke it.
+2. `get_issue <id>` — where it fires, how many users, which clients, the
+   attributes on the latest occurrence (platform, app version, whatever the
+   app attached), and **the ids of the request and trace behind each recent
+   occurrence**. A stack trace too, *when there is one* — errors reported from
+   a mobile SDK or recorded as an HTTP status often have none, and that is not
+   a failure. Go to the request and the trace instead; do not describe a stack
+   you were not given.
+3. `get_request <request-id>` — the captured request: method, path, status,
+   duration, and the headers, body and response **when they were captured**.
+   This is the input that broke it, and the reason to come here at all.
+   Backend SDKs capture the payload; an error reported from a mobile SDK often
+   carries only timing and the trace id. If a body is not in the output, say
+   so and use the trace — never describe a body you were not shown.
 4. `get_trace <trace-id>` — the span tree, when the failure is about where time
    went or which downstream call failed.
 5. `search_logs --search <something from the error> --level error` — to confirm
    the path is the only one that reaches the failing line, or to find the
    surrounding context.
 
-Then open the file named in the stack trace, read it, and fix the cause. Use
-the captured body as the fixture for a regression test.
+A long duration on a failing request (say 60s flat) is a timeout, and the
+trace names what timed out. Read the number before theorising.
+
+Then open the file named in the stack trace — or, with no stack, the handler
+for the route the issue names — read it, and fix the cause. Use the captured
+body as the fixture for a regression test.
+
+Each read ends with a **Next** block naming the exact call to make with the
+ids it just gave you. Following it is usually right; it is built from what the
+response actually contains.
 
 ## Diagnosing slowness
 
@@ -101,8 +117,11 @@ shipped, leave it open and say so.
 
 ## Reporting back
 
-Cite ids. "Issue `5f3ac1`, 412 occurrences across 38 users since the 2.4.0
-release" is checkable; "there is a TypeError in checkout" is not. When you
+Cite ids and the numbers you were given. "Issue `1a1e17c9`, 47 occurrences
+across 2 users, `GET /v1/team-players`, 500s, first seen 3 days ago" is
+checkable; "there is an error in the players endpoint" is not. Report fields
+that were actually in the output — there is no release field, so do not invent
+one from a version number in the attributes. When you
 propose a fix, name the evidence that says it is the cause — the request body,
 the span, the log line — and be explicit when you are inferring instead.
 
