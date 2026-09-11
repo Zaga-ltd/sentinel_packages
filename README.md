@@ -1,3 +1,22 @@
+# Sentrinel packages
+
+The public SDKs for [Sentrinel](https://sentrinel.dev). Four packages, one repo.
+
+| Package | For | Install |
+|---|---|---|
+| [`src/`](src) | Elysia, Express, Next.js, Bun, any JS backend | `bun add @sentrinel/plugin` |
+| [`sentrinel_django/`](sentrinel_django) | Django 3.1 – 5.2 | `pip install "git+https://github.com/Zaga-ltd/sentinel_packages.git#subdirectory=sentrinel_django"` |
+| [`sentrinel_flutter/`](sentrinel_flutter) | Flutter and Dart apps | a git dependency in `pubspec.yaml` |
+| [`mcp/`](mcp) | Claude Code, Codex and other agents | `curl -fsSL https://sentrinel.dev/install-mcp.sh \| bash` |
+
+Documentation lives at **[docs.sentrinel.dev](https://docs.sentrinel.dev)** —
+[JavaScript](https://docs.sentrinel.dev/reference/plugin/),
+[Django](https://docs.sentrinel.dev/reference/django/),
+[mobile](https://docs.sentrinel.dev/reference/mobile/),
+[coding agents](https://docs.sentrinel.dev/reference/mcp/).
+
+---
+
 # @sentrinel/plugin
 
 Monitoring plugin for [Elysia.js](https://elysiajs.com) apps. Sends metrics, request logs, errors, application logs, and resource usage to a self-hosted [Sentrinel](https://github.com/Zaga-ltd/sentinel) server.

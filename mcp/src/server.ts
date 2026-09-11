@@ -29,6 +29,10 @@ import {
   logsToMarkdown,
   traceToMarkdown,
   requestToMarkdown,
+  databasesToMarkdown,
+  slowQueriesToMarkdown,
+  dbActivityToMarkdown,
+  dbHealthToMarkdown,
 } from "./format";
 
 const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
@@ -39,9 +43,18 @@ const fail = (err: unknown) => ({
 
 const PERIOD = z
   .string()
-  .regex(/^\d+[mhd]$/, "a duration like 1h, 24h, 7d")
+  .regex(/^\d+\s*[smhdw]?$/i, "a duration like 30m, 24h, 7d, 2w")
   .optional()
-  .describe("How far back to look: 1h, 24h, 7d. Default varies by tool.");
+  .describe("How far back to look: 30m, 24h, 7d, 2w. Default varies by tool.");
+
+/** How to rank the issue list — the question being asked, in effect. */
+const ISSUE_SORT = z
+  .enum(["last_seen", "occurrences", "users", "first_seen"])
+  .optional()
+  .describe(
+    "last_seen (default, newest firing) · occurrences (most repeated — the noisiest bug) · " +
+      "users (widest blast radius, worst for customers) · first_seen (oldest, the long-standing ones)"
+  );
 
 export function buildServer(client: SentrinelClient): McpServer {
   const server = new McpServer({ name: "sentrinel", version: "0.1.0" });
@@ -51,10 +64,13 @@ export function buildServer(client: SentrinelClient): McpServer {
     {
       title: "List issues",
       description:
-        "The bugs Sentrinel has grouped, newest-firing first. Start here. Each line has the issue id to pass to get_issue.",
+        "The bugs Sentrinel has grouped. Start here — each line carries the issue id to pass to get_issue. " +
+        "Use `sort` to ask a different question: `occurrences` for the most repeated, `users` for the one " +
+        "hurting the most people, `first_seen` for what has been broken longest.",
       inputSchema: {
         status: z.enum(["unresolved", "resolved", "ignored", "all"]).optional().describe("Default unresolved."),
         period: PERIOD,
+        sort: ISSUE_SORT,
         search: z.string().optional().describe("Match against the title or culprit."),
         limit: z.number().int().min(1).max(100).optional(),
       },
@@ -63,7 +79,8 @@ export function buildServer(client: SentrinelClient): McpServer {
     async (a) => {
       try {
         const status = a.status === "all" ? "" : a.status;
-        return ok(issuesToMarkdown(await client.listIssues({ ...a, status }), a.status ?? "unresolved"));
+        const res = await client.listIssues({ ...a, status });
+        return ok(issuesToMarkdown(res, a.status ?? "unresolved", a.sort));
       } catch (e) {
         return fail(e);
       }
@@ -138,6 +155,97 @@ export function buildServer(client: SentrinelClient): McpServer {
     async ({ id }) => {
       try {
         return ok(requestToMarkdown(await client.getRequest(id)));
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
+
+  // ── Databases ───────────────────────────────────────────────────────────
+  //
+  // A slow endpoint is very often a slow query, and the answer is on the other
+  // side of the connection where the application's own telemetry cannot see.
+  // These read the collector's view of Postgres, scoped to this app's
+  // databases like everything else.
+
+  const SECONDS = z
+    .number()
+    .int()
+    .min(60)
+    .max(86_400)
+    .optional()
+    .describe("Window in seconds. Default 3600 (one hour).");
+
+  server.registerTool(
+    "list_databases",
+    {
+      title: "List databases",
+      description:
+        "The Postgres instances reporting for this app, with the id to pass to the other database tools.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async () => {
+      try {
+        return ok(databasesToMarkdown(await client.listDatabases()));
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "slow_queries",
+    {
+      title: "Slow queries",
+      description:
+        "Query shapes ranked by their share of execution time, with full text, call counts, cache hit ratio and which endpoints called them. This is where a slow endpoint usually turns out to live.",
+      inputSchema: {
+        id: z.string().describe("Database id from list_databases."),
+        period: SECONDS,
+        sort: z.enum(["total", "mean", "calls"]).optional().describe("Default total time."),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ id, period, sort }) => {
+      try {
+        return ok(slowQueriesToMarkdown(await client.slowQueries(id, { period, sort })));
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "db_activity",
+    {
+      title: "Database activity",
+      description:
+        "What the database was waiting on — wait events, blocking chains, and the longest-running statements. Use when queries are slow but no single query looks expensive.",
+      inputSchema: { id: z.string().describe("Database id."), period: SECONDS },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ id, period }) => {
+      try {
+        return ok(dbActivityToMarkdown(await client.dbActivity(id, period)));
+      } catch (e) {
+        return fail(e);
+      }
+    }
+  );
+
+  server.registerTool(
+    "db_health",
+    {
+      title: "Database health",
+      description:
+        "Connections, idle-in-transaction, commits and rollbacks, deadlocks and temp bytes. The four ways a Postgres database stops, as numbers.",
+      inputSchema: { id: z.string().describe("Database id."), period: SECONDS },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ id, period }) => {
+      try {
+        return ok(dbHealthToMarkdown(await client.dbHealth(id, period)));
       } catch (e) {
         return fail(e);
       }

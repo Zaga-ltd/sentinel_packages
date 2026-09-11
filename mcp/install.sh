@@ -35,6 +35,25 @@ fail() { printf '\n  %s\n\n' "$*" >&2; exit 1; }
 
 printf '\n  Sentrinel for coding agents %s\n\n' "$VERSION"
 
+# Validate the key before doing any work.
+#
+# A key pasted straight from the documentation keeps the example's ellipsis. It
+# has the right prefix, so a prefix check waves it through, and the failure
+# lands much later as an invalid-header error from fetch — which reads as "the
+# API is unreachable". Checked here, nothing is downloaded and nothing is
+# written for a value that cannot work.
+if [ -n "$API_KEY" ]; then
+  case "$API_KEY" in
+    *[!A-Za-z0-9_]*)
+      fail "SENTRINEL_API_KEY is not a key — it contains characters a key cannot have. If you copied the example from the docs, that is a placeholder: use the real value from API Keys -> Generate -> AI agent." ;;
+  esac
+  case "$API_KEY" in
+    snt_mcp_????????????????*|snt_mcprw_????????????????*) ;;
+    snt_mcp_*|snt_mcprw_*)
+      fail "SENTRINEL_API_KEY is too short to be a key. Copy the whole value from the dashboard." ;;
+  esac
+fi
+
 command -v curl >/dev/null 2>&1 || fail "curl is required."
 
 # The bundles are built --target=bun and run under Bun. Install it rather than

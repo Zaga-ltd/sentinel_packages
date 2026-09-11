@@ -1,0 +1,306 @@
+"""Real requests through the real middleware, with the network stubbed.
+
+What these pin down is the contract with the API — field names and shapes — and
+the promise that telemetry never changes what the application returns.
+"""
+
+import json
+
+import pytest
+from django.test import RequestFactory
+
+from sentrinel_django import collector as collector_module
+from sentrinel_django import metrics
+from sentrinel_django.config import load
+from sentrinel_django.middleware import SentrinelMiddleware
+
+
+class Captured:
+    """Stands in for the network, and remembers what would have been sent."""
+
+    def __init__(self):
+        self.posts = []
+
+    def install(self, collector):
+        collector._post = lambda path, payload, attempt=0: self.posts.append((path, payload))
+        return collector
+
+    def payload(self, path):
+        for p, body in self.posts:
+            if p == path:
+                return body
+        return None
+
+    def rows(self, path, key):
+        body = self.payload(path)
+        return body[key] if body else []
+
+
+@pytest.fixture
+def sent():
+    return Captured()
+
+
+@pytest.fixture
+def build(sent):
+    """A middleware wired to a stubbed collector, with whatever config."""
+
+    def _build(view=None, **overrides):
+        cfg = load({"SERVER_URL": "http://api.test", "APP_NAME": "orders", "ENV": "prod", **overrides})
+        collector_module.reset_collector()
+        collector = sent.install(collector_module.Collector(cfg))
+        collector_module.set_collector(collector)
+        # The flusher would otherwise start a thread per test.
+        collector._ensure_started = lambda: None
+        mw = SentrinelMiddleware(view or (lambda r: __import__("django.http", fromlist=["HttpResponse"]).HttpResponse("ok")))
+        mw.config = cfg
+        mw.collector = collector
+        return mw
+
+    return _build
+
+
+@pytest.fixture(autouse=True)
+def _clean():
+    metrics._registry = metrics.MetricRegistry()
+    yield
+    collector_module.reset_collector()
+
+
+rf = RequestFactory()
+
+
+class TestRequestCapture:
+    def test_a_request_produces_a_row_the_api_accepts(self, build, sent):
+        mw = build()
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+
+        body = sent.payload("/api/ingest/requests")
+        assert body["appName"] == "orders" and body["env"] == "prod"
+        row = body["requests"][0]
+        # Exactly the field names the ingest route reads.
+        for key in ("id", "method", "path", "route", "statusCode", "responseTime", "timestamp", "sampleRate"):
+            assert key in row, key
+        assert row["method"] == "GET" and row["statusCode"] == 200
+        assert row["responseTime"] >= 0
+
+    def test_the_response_is_unchanged(self, build):
+        from django.http import HttpResponse
+
+        mw = build(lambda r: HttpResponse("payload", status=201))
+        res = mw(rf.get("/ok/"))
+        assert res.status_code == 201 and res.content == b"payload"
+
+    def test_metrics_roll_up_instead_of_one_row_per_request(self, build, sent):
+        mw = build()
+        for _ in range(50):
+            mw(rf.get("/ok/"))
+        mw.collector.flush()
+
+        endpoints = sent.rows("/api/ingest/metrics", "endpoints")
+        assert len(endpoints) == 1
+        assert endpoints[0]["requestCount"] == 50 and endpoints[0]["successCount"] == 50
+        for key in ("p50ResponseTime", "p95ResponseTime", "p99ResponseTime", "statusCodes"):
+            assert key in endpoints[0]
+
+    def test_excluded_paths_are_not_recorded(self, build, sent):
+        mw = build(EXCLUDE_PATHS=[r"^/health"])
+        mw(rf.get("/health/"))
+        mw.collector.flush()
+        assert sent.payload("/api/ingest/requests") is None
+
+    def test_credentials_are_masked_before_buffering(self, build, sent):
+        mw = build()
+        mw(rf.get("/ok/", HTTP_AUTHORIZATION="Bearer secret-token", HTTP_ACCEPT="application/json"))
+        mw.collector.flush()
+        headers = sent.rows("/api/ingest/requests", "requests")[0]["requestHeaders"]
+        assert headers["authorization"] == "***"
+        assert headers["accept"] == "application/json"
+        assert "secret-token" not in json.dumps(sent.posts, default=str)
+
+    def test_query_secrets_are_masked(self, build, sent):
+        mw = build()
+        mw(rf.get("/ok/?page=2&api_key=live-key"))
+        mw.collector.flush()
+        params = sent.rows("/api/ingest/requests", "requests")[0]["queryParams"]
+        assert params["page"] == "2" and params["api_key"] == "***"
+
+    def test_bodies_are_off_unless_asked_for(self, build, sent):
+        mw = build()
+        mw(rf.post("/ok/", data=json.dumps({"password": "x"}), content_type="application/json"))
+        mw.collector.flush()
+        assert "requestBody" not in sent.rows("/api/ingest/requests", "requests")[0]
+
+    def test_a_captured_body_is_masked(self, build, sent):
+        mw = build(LOG_REQUEST_BODY=True)
+        mw(rf.post("/ok/", data=json.dumps({"user": "a", "password": "hunter2"}), content_type="application/json"))
+        mw.collector.flush()
+        body = json.loads(sent.rows("/api/ingest/requests", "requests")[0]["requestBody"])
+        assert body["password"] == "***" and body["user"] == "a"
+
+    def test_the_client_ip_is_the_caller_not_the_proxy(self, build, sent):
+        mw = build()
+        mw(rf.get("/ok/", HTTP_X_FORWARDED_FOR="203.0.113.7, 10.0.0.1, 10.0.0.2"))
+        mw.collector.flush()
+        assert sent.rows("/api/ingest/requests", "requests")[0]["clientIp"] == "203.0.113.7"
+
+
+class TestErrors:
+    def test_a_view_exception_is_captured_and_still_raised(self, build, sent):
+        def boom(request):
+            raise ValueError("kaboom")
+
+        mw = build(boom)
+        request = rf.get("/boom/")
+        with pytest.raises(ValueError):
+            response = mw(request)  # noqa: F841
+        # Django calls process_exception itself; the middleware contract is
+        # that it records when asked.
+        mw.process_exception(request, ValueError("kaboom"))
+        mw.collector.flush()
+
+        err = sent.rows("/api/ingest/errors", "errors")[0]
+        assert err["errorType"] == "ValueError" and err["errorMessage"] == "kaboom"
+        assert "Traceback" in err["stackTrace"] or "ValueError" in err["stackTrace"]
+        assert err["statusCode"] == 500
+
+    def test_an_error_is_never_sampled_away(self, build, sent):
+        from django.http import HttpResponse
+
+        mw = build(lambda r: HttpResponse("no", status=500), SAMPLE_RATE=0.0)
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+        rows = sent.rows("/api/ingest/requests", "requests")
+        assert len(rows) == 1 and rows[0]["sampleRate"] == 1
+
+    def test_ordinary_traffic_is_sampled_away_at_rate_zero(self, build, sent):
+        mw = build(SAMPLE_RATE=0.0)
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+        assert sent.payload("/api/ingest/requests") is None
+        # …but it still counted, because metrics are exact regardless of sampling.
+        assert sent.rows("/api/ingest/metrics", "endpoints")[0]["requestCount"] == 1
+
+
+    def test_an_error_reports_the_route_so_it_shares_the_endpoint(self, build, sent):
+        """An error's path registers an endpoint, same as a request's route.
+
+        Sending the raw URL here created a twin: /boom/ beside /boom, with the
+        endpoint's error count split away from its traffic. Caught end to end
+        against a real API, not by a unit test.
+        """
+        from django.test import RequestFactory
+        from django.urls import ResolverMatch
+
+        mw = build()
+        request = RequestFactory().get("/orders/1042/")
+        request.resolver_match = ResolverMatch(func=lambda r: None, args=(), kwargs={}, url_name="d", route="orders/<int:pk>/")
+        mw.process_exception(request, ValueError("x"))
+        mw.collector.flush()
+
+        assert sent.rows("/api/ingest/errors", "errors")[0]["path"] == "/orders/:pk"
+
+
+class TestIdentity:
+    def test_a_custom_resolver_names_the_consumer(self, build, sent):
+        mw = build(CONSUMER_IDENTIFIER=lambda request: "tenant-42")
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+        assert sent.rows("/api/ingest/requests", "requests")[0]["consumerIdentifier"] == "tenant-42"
+        assert sent.rows("/api/ingest/metrics", "consumers")[0]["identifier"] == "tenant-42"
+
+    def test_a_broken_resolver_does_not_break_the_request(self, build, sent):
+        def explode(request):
+            raise RuntimeError("bad resolver")
+
+        mw = build(CONSUMER_IDENTIFIER=explode)
+        res = mw(rf.get("/ok/"))
+        assert res.status_code == 200
+        mw.collector.flush()
+        assert sent.rows("/api/ingest/requests", "requests")[0]["consumerIdentifier"] is None
+
+    def test_context_added_in_a_view_lands_on_the_row(self, build, sent):
+        from django.http import HttpResponse
+
+        from sentrinel_django import add_context, set_consumer
+
+        def view(request):
+            add_context(tier="enterprise", order_id=7)
+            set_consumer("acme")
+            return HttpResponse("ok")
+
+        mw = build(view)
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+        row = sent.rows("/api/ingest/requests", "requests")[0]
+        assert row["attributes"] == {"tier": "enterprise", "order_id": 7}
+        assert row["consumerIdentifier"] == "acme"
+
+
+class TestLogs:
+    def test_a_log_line_carries_the_request_that_wrote_it(self, build, sent):
+        import logging
+
+        from django.http import HttpResponse
+
+        from sentrinel_django import SentrinelLogHandler
+
+        handler = SentrinelLogHandler()
+        logger = logging.getLogger("shop.checkout")
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+
+        def view(request):
+            logger.info("card declined", extra={"order_id": 42})
+            return HttpResponse("ok")
+
+        try:
+            mw = build(view)
+            mw(rf.get("/ok/"))
+            mw.collector.flush()
+        finally:
+            logger.removeHandler(handler)
+
+        line = sent.rows("/api/ingest/logs", "logs")[0]
+        request_row = sent.rows("/api/ingest/requests", "requests")[0]
+        # The correlation is the point: same id, so the line opens its request.
+        assert line["requestId"] == request_row["id"]
+        assert line["message"] == "card declined"
+        assert line["level"] == "info"
+        assert line["category"] == "shop.checkout"
+        assert line["attributes"]["order_id"] == 42
+
+
+class TestCustomMetrics:
+    def test_counters_ride_the_same_flush(self, build, sent):
+        from sentrinel_django import count
+
+        mw = build()
+        for _ in range(500):
+            count("llm.tokens", 3, {"model": "deepseek"})
+        mw.collector.flush()
+
+        body = sent.payload("/api/ingest/custom-metrics")
+        assert body["appName"] == "orders"
+        assert len(body["metrics"]) == 1
+        assert body["metrics"][0]["sum"] == 1500
+
+
+class TestCollectorLifecycle:
+    def test_a_second_middleware_joins_rather_than_evicting_the_first(self, build, sent):
+        """Django can build more than one middleware instance in a process.
+
+        An earlier version replaced the process collector whenever one was
+        constructed with a config, which silently discarded everything the
+        first had buffered — and the log handler, which looks the collector up
+        by itself, then shipped to an instance nobody was flushing.
+        """
+        mw = build()
+        mw(rf.get("/ok/"))  # buffered, not yet flushed
+
+        second = SentrinelMiddleware(lambda r: __import__("django.http", fromlist=["HttpResponse"]).HttpResponse("ok"))
+        assert second.collector is mw.collector
+
+        mw.collector.flush()
+        assert len(sent.rows("/api/ingest/requests", "requests")) == 1

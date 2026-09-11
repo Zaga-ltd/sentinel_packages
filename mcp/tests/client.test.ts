@@ -3,7 +3,7 @@
 // it never comes back out — not in a URL, not in an error.
 
 import { describe, expect, test } from "bun:test";
-import { configFromEnv, SentrinelClient, SentrinelError } from "../src/client";
+import { configFromEnv, periodSeconds, SentrinelClient, SentrinelError } from "../src/client";
 
 const KEY = "snt_mcp_0123456789abcdef";
 
@@ -38,10 +38,58 @@ describe("configuration", () => {
     }
   });
 
+  test("refuses the documentation placeholder instead of failing at the network", () => {
+    // snt_mcp_… has the right prefix and is not a key. Reaching fetch() it
+    // fails as an invalid header value, which reads as "the API is down".
+    for (const placeholder of ["snt_mcp_\u2026", "snt_mcprw_\u2026", "snt_mcp_"]) {
+      expect(() =>
+        configFromEnv({ SENTRINEL_API_URL: "https://api.example", SENTRINEL_API_KEY: placeholder })
+      ).toThrow(/does not look like a key/);
+    }
+  });
+
   test("accepts both agent kinds and trims a trailing slash", () => {
     const cfg = configFromEnv({ SENTRINEL_API_URL: "https://api.example/", SENTRINEL_API_KEY: KEY });
     expect(cfg.url).toBe("https://api.example");
-    expect(configFromEnv({ SENTRINEL_API_URL: "https://api.example", SENTRINEL_API_KEY: "snt_mcprw_x" }).key).toBe("snt_mcprw_x");
+    expect(
+      configFromEnv({ SENTRINEL_API_URL: "https://api.example", SENTRINEL_API_KEY: "snt_mcprw_0123456789abcdef" }).key
+    ).toBe("snt_mcprw_0123456789abcdef");
+  });
+});
+
+describe("the period a person writes", () => {
+  // The API parses `period` with parseInt and treats it as seconds, so "7d"
+  // arrives as SEVEN SECONDS — every query silently empty, no error anywhere.
+  // That shipped, and the test that should have caught it inserted a row
+  // milliseconds before querying, so a 7-second window contained it.
+  test("a duration becomes seconds, not its first digits", () => {
+    expect(periodSeconds("7d", 1)).toBe(604800);
+    expect(periodSeconds("24h", 1)).toBe(86400);
+    expect(periodSeconds("30m", 1)).toBe(1800);
+    expect(periodSeconds("2w", 1)).toBe(1209600);
+    expect(periodSeconds("90", 1)).toBe(90);
+    expect(periodSeconds(3600, 1)).toBe(3600);
+  });
+
+  test("nonsense falls back rather than becoming a tiny window", () => {
+    for (const bad of ["", "abc", "-5", "0", "7 days", undefined]) {
+      expect(periodSeconds(bad as any, 604800)).toBe(604800);
+    }
+  });
+
+  test("the wire always carries seconds", async () => {
+    const { fetchImpl, calls } = fakeFetch(200, { issues: [] });
+    const client = new SentrinelClient({ url: "https://api.example", key: KEY }, fetchImpl);
+    await client.listIssues({ period: "7d" });
+    expect(calls[0].url).toContain("period=604800");
+    expect(calls[0].url).not.toContain("period=7d");
+  });
+
+  test("sort is passed through so the list can answer a different question", async () => {
+    const { fetchImpl, calls } = fakeFetch(200, { issues: [] });
+    const client = new SentrinelClient({ url: "https://api.example", key: KEY }, fetchImpl);
+    await client.listIssues({ sort: "occurrences" });
+    expect(calls[0].url).toContain("sort=occurrences");
   });
 });
 
@@ -57,7 +105,7 @@ describe("requests", () => {
     expect(url).not.toContain(KEY);
     expect(url).toContain("/api/issues?");
     expect(url).toContain("status=unresolved");
-    expect(url).toContain("period=7d");
+    expect(url).toContain("period=604800"); // seconds on the wire, never "7d"
     expect(url).toContain("search=boom");
   });
 

@@ -6,7 +6,8 @@
 // Output is Markdown on stdout; every failure goes to stderr with exit 1, so
 // a caller can tell an empty result from a broken one.
 //
-//   sentrinel issues [--status unresolved|resolved|ignored|all] [--period 7d] [--search q] [--limit 20]
+//   sentrinel issues [--status unresolved|resolved|ignored|all] [--period 7d] [--limit 20]
+//                   [--sort last_seen|occurrences|users|first_seen] [--search q]
 //   sentrinel issue <id> [--period 7d]
 //   sentrinel logs [--search q] [--level error] [--period 24h] [--limit 50]
 //   sentrinel trace <id>
@@ -24,15 +25,24 @@ import {
   logsToMarkdown,
   traceToMarkdown,
   requestToMarkdown,
+  databasesToMarkdown,
+  slowQueriesToMarkdown,
+  dbActivityToMarkdown,
+  dbHealthToMarkdown,
 } from "./format";
 
 const USAGE = `sentrinel — Sentrinel for coding agents
 
-  sentrinel issues [--status unresolved|resolved|ignored|all] [--period 7d] [--search q] [--limit 20]
+  sentrinel issues [--status unresolved|resolved|ignored|all] [--period 7d] [--limit 20]
+                   [--sort last_seen|occurrences|users|first_seen] [--search q]
   sentrinel issue <id> [--period 7d]
   sentrinel logs [--search q] [--level error] [--period 24h] [--limit 50]
   sentrinel trace <id>
   sentrinel request <id>
+  sentrinel databases                       Postgres instances reporting for this app
+  sentrinel queries <db-id> [--period 3600] [--sort total|mean|calls]
+  sentrinel activity <db-id> [--period 3600]    wait events, blocking, longest running
+  sentrinel dbhealth <db-id> [--period 3600]    connections, deadlocks, temp bytes
   sentrinel resolve|ignore|reopen <id>      needs an "AI agent — may resolve issues" key
   --json                                    raw API response
 
@@ -83,8 +93,9 @@ export async function run(argv: string[], client: SentrinelClient): Promise<stri
         period: str(flags.period),
         search: str(flags.search),
         limit: num(flags.limit),
+        sort: str(flags.sort),
       });
-      return out(res, () => issuesToMarkdown(res, str(flags.status) ?? "unresolved"));
+      return out(res, () => issuesToMarkdown(res, str(flags.status) ?? "unresolved", str(flags.sort)));
     }
     case "issue": {
       const [id] = positional;
@@ -113,6 +124,28 @@ export async function run(argv: string[], client: SentrinelClient): Promise<stri
       const res = await client.getRequest(id);
       return out(res, () => requestToMarkdown(res));
     }
+    case "databases": {
+      const res = await client.listDatabases();
+      return out(res, () => databasesToMarkdown(res));
+    }
+    case "queries": {
+      const [id] = positional;
+      if (!id) throw new Error("usage: sentrinel queries <db-id>");
+      const res = await client.slowQueries(id, { period: num(flags.period), sort: str(flags.sort) });
+      return out(res, () => slowQueriesToMarkdown(res));
+    }
+    case "activity": {
+      const [id] = positional;
+      if (!id) throw new Error("usage: sentrinel activity <db-id>");
+      const res = await client.dbActivity(id, num(flags.period));
+      return out(res, () => dbActivityToMarkdown(res));
+    }
+    case "dbhealth": {
+      const [id] = positional;
+      if (!id) throw new Error("usage: sentrinel dbhealth <db-id>");
+      const res = await client.dbHealth(id, num(flags.period));
+      return out(res, () => dbHealthToMarkdown(res));
+    }
     case "resolve":
     case "ignore":
     case "reopen": {
@@ -133,6 +166,13 @@ export async function run(argv: string[], client: SentrinelClient): Promise<stri
 
 if (import.meta.main) {
   try {
+    // Usage must not need credentials. Asking someone to configure a key
+    // before the tool will tell them what it does is the wrong way round.
+    const first = process.argv[2];
+    if (!first || first === "help" || first === "--help" || first === "-h") {
+      process.stdout.write(USAGE + "\n");
+      process.exit(0);
+    }
     const client = new SentrinelClient(configFromEnv());
     const text = await run(process.argv.slice(2), client);
     process.stdout.write(text + "\n");

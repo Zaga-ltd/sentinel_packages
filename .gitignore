@@ -2,6 +2,11 @@ node_modules/
 *.log
 sentrinel_flutter/.dart_tool/
 sentrinel_flutter/pubspec.lock
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
 
 # Never publish local application data that happens to sit in this folder.
 Claude/
