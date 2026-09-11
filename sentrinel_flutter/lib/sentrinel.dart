@@ -64,6 +64,13 @@ class Sentrinel {
 
   static SentrinelCollector? _collector;
   static String? _consumer;
+
+  /// What [consumer] falls back to when nobody is signed in.
+  ///
+  /// The value passed to [init] — a platform, a build, a tenant. Keeping it
+  /// means signing out returns to that rather than to nothing, so anonymous
+  /// traffic stays attributable to *something* instead of vanishing.
+  static String? _consumerFallback;
   static Map<String, Object?> _context = {};
   static CrashSpool? _spool;
   static final BreadcrumbTrail _crumbs = BreadcrumbTrail();
@@ -118,6 +125,7 @@ class Sentrinel {
     bool persistCrashes = true,
   }) {
     _collector?.dispose();
+    _consumerFallback = consumerIdentifier;
     _consumer = consumerIdentifier;
     _device = deviceContext();
     _release = release;
@@ -228,6 +236,21 @@ class Sentrinel {
   static void identify(String? userId, {Map<String, Object?>? properties}) {
     _userId = (userId != null && userId.trim().isEmpty) ? null : userId;
     _collector?.userId = _userId;
+
+    // Identifying someone is the statement that this traffic is theirs, so it
+    // moves the consumer too.
+    //
+    // Without this the two identities drifted apart: events knew who the user
+    // was and every request, log and error was still filed under whatever was
+    // passed to init(). An app that set a platform there — a reasonable
+    // reading, since there was no way to change it later — produced a
+    // Consumers page listing "mobile_android" and "mobile_ios" and no people
+    // at all, which is the one view whose entire job is naming them.
+    //
+    // Signing out returns to the init value rather than to null: anonymous
+    // traffic belonging to "mobile_android" is worth more than traffic
+    // belonging to nobody.
+    _consumer = _userId ?? _consumerFallback;
 
     if (_userId == null) return;
     _collector?.recordEvent(EventRecord(
@@ -524,6 +547,17 @@ class Sentrinel {
     _sessionId = null;
     _sessionStartedAt = null;
     _crumbs.clear();
+  }
+
+  /// Attribute this app's traffic to something other than the signed-in user.
+  ///
+  /// [identify] covers the usual case. Reach for this when the thing you want
+  /// on the Consumers page is not the person — a tenant, a device, an API
+  /// client — or when identity arrives from somewhere other than a sign-in.
+  /// Passing null returns to the value [init] was given.
+  static void setConsumer(String? identifier) {
+    final trimmed = identifier?.trim();
+    _consumer = (trimmed == null || trimmed.isEmpty) ? _consumerFallback : trimmed;
   }
 
   // ── internals used by the client wrapper ──

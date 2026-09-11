@@ -427,4 +427,53 @@ void main() {
       expect(captured.byPath['/api/ingest/metrics'], isNull);
     });
   });
+
+  group('who the traffic belongs to', () {
+    // The Consumers page listed "mobile_android" and "mobile_ios" and no
+    // people. consumerIdentifier was fixed at init() with no way to change it,
+    // and identify() only moved the *event* identity — so requests, logs and
+    // errors stayed filed under whatever init() was given.
+    setUp(() {
+      Sentrinel.init(
+        serverUrl: 'http://localhost:9',
+        appName: 'test',
+        env: 'test',
+        apiKey: 'k',
+        consumerIdentifier: 'mobile_android',
+        persistCrashes: false,
+      );
+    });
+
+    tearDown(Sentrinel.close);
+
+    test('starts as whatever init was given', () {
+      expect(Sentrinel.consumer, 'mobile_android');
+    });
+
+    test('identifying a user attributes their traffic to them', () {
+      Sentrinel.identify('user_42');
+      expect(Sentrinel.consumer, 'user_42');
+      expect(Sentrinel.currentUserId, 'user_42');
+    });
+
+    test('signing out falls back to the init value, not to nobody', () {
+      Sentrinel.identify('user_42');
+      Sentrinel.identify(null);
+      expect(Sentrinel.consumer, 'mobile_android');
+      expect(Sentrinel.currentUserId, isNull);
+    });
+
+    test('a blank id is not an identity', () {
+      Sentrinel.identify('   ');
+      expect(Sentrinel.consumer, 'mobile_android');
+      expect(Sentrinel.currentUserId, isNull);
+    });
+
+    test('setConsumer names something that is not the signed-in user', () {
+      Sentrinel.setConsumer('tenant_7');
+      expect(Sentrinel.consumer, 'tenant_7');
+      Sentrinel.setConsumer(null);
+      expect(Sentrinel.consumer, 'mobile_android');
+    });
+  });
 }
