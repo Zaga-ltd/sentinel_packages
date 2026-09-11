@@ -13,7 +13,7 @@ dependencies:
   sentrinel_flutter:
     git:
       url: https://github.com/Zaga-ltd/sentinel_packages
-      path: packages/sentrinel_flutter_integration
+      path: sentrinel_flutter_integration
 ```
 
 ## Use

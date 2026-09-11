@@ -7,7 +7,7 @@ it and an error opens the user it happened to.
 Tested on **Django 3.1 through 5.2**, Python 3.8+. No runtime dependencies.
 
 ```bash
-pip install sentrinel-django
+pip install "git+https://github.com/Zaga-ltd/sentinel_packages.git#subdirectory=sentrinel_django"
 ```
 
 ```python
