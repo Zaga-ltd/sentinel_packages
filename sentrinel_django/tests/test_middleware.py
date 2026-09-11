@@ -304,3 +304,110 @@ class TestCollectorLifecycle:
 
         mw.collector.flush()
         assert len(sent.rows("/api/ingest/requests", "requests")) == 1
+
+
+class TestTracePropagation:
+    """Mobile → backend on one trace, which is the point of the header."""
+
+    MOBILE = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+    def test_a_request_from_the_app_continues_its_trace(self, build, sent):
+        mw = build()
+        mw(rf.get("/ok/", HTTP_TRACEPARENT=self.MOBILE))
+        mw.collector.flush()
+        row = sent.rows("/api/ingest/requests", "requests")[0]
+        # Same trace as the tap that caused it, not a fresh one.
+        assert row["traceId"] == "4bf92f3577b34da6a3ce929d0e0e4736"
+
+    def test_a_request_with_no_header_starts_its_own_trace(self, build, sent):
+        mw = build()
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+        row = sent.rows("/api/ingest/requests", "requests")[0]
+        assert len(row["traceId"]) == 32
+
+    def test_a_forged_header_does_not_become_a_trace_id(self, build, sent):
+        mw = build()
+        mw(rf.get("/ok/", HTTP_TRACEPARENT="'; drop table --"))
+        mw.collector.flush()
+        row = sent.rows("/api/ingest/requests", "requests")[0]
+        assert row["traceId"] != "'; drop table --"
+        assert len(row["traceId"]) == 32
+
+    def test_log_lines_carry_the_same_trace_and_a_span(self, build, sent):
+        import logging
+
+        from django.http import HttpResponse
+
+        from sentrinel_django import SentrinelLogHandler
+
+        handler = SentrinelLogHandler()
+        logger = logging.getLogger("trace.test")
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+
+        def view(request):
+            logger.info("inside the trace")
+            return HttpResponse("ok")
+
+        try:
+            mw = build(view)
+            mw(rf.get("/ok/", HTTP_TRACEPARENT=self.MOBILE))
+            mw.collector.flush()
+        finally:
+            logger.removeHandler(handler)
+
+        line = sent.rows("/api/ingest/logs", "logs")[0]
+        assert line["traceId"] == "4bf92f3577b34da6a3ce929d0e0e4736"
+        assert len(line["spanId"]) == 16
+
+    def test_an_error_carries_the_trace_so_the_issue_opens_the_waterfall(self, build, sent):
+        from django.http import HttpResponse
+
+        # Django calls process_exception *during* the request, while the
+        # context is still live — calling it afterwards is what a test does,
+        # not what the framework does, and the error would lose its trace.
+        holder = {}
+
+        def view(request):
+            try:
+                raise ValueError("x")
+            except ValueError as exc:
+                holder["mw"].process_exception(request, exc)
+                return HttpResponse(status=500)
+
+        mw = build(view)
+        holder["mw"] = mw
+        mw(rf.get("/boom/", HTTP_TRACEPARENT=self.MOBILE))
+        mw.collector.flush()
+
+        err = sent.rows("/api/ingest/errors", "errors")[0]
+        assert err["traceId"] == "4bf92f3577b34da6a3ce929d0e0e4736"
+        # And the request row shares it, so the issue opens the waterfall.
+        assert sent.rows("/api/ingest/requests", "requests")[0]["traceId"] == err["traceId"]
+
+    def test_outgoing_headers_pass_the_chain_on(self, build):
+        from django.http import HttpResponse
+
+        from sentrinel_django import outgoing_headers
+
+        captured = {}
+
+        def view(request):
+            captured.update(outgoing_headers({"content-type": "application/json"}))
+            return HttpResponse("ok")
+
+        mw = build(view)
+        mw(rf.get("/ok/", HTTP_TRACEPARENT=self.MOBILE))
+
+        # Same trace continues downstream; the span is this service's, so the
+        # next hop hangs off our work rather than off the phone's.
+        assert captured["traceparent"].startswith("00-4bf92f3577b34da6a3ce929d0e0e4736-")
+        assert not captured["traceparent"].startswith("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7")
+        assert captured["content-type"] == "application/json"
+
+    def test_outside_a_request_nothing_is_invented(self):
+        from sentrinel_django import current_trace, outgoing_headers
+
+        assert outgoing_headers({"a": "b"}) == {"a": "b"}
+        assert current_trace()["trace_id"] is None

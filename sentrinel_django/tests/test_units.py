@@ -168,3 +168,47 @@ class TestMetrics:
         metrics.gauge("q", 1)
         metrics.registry().drain("t")
         assert metrics.registry().drain("t") == []
+
+
+class TestTraceContext:
+    """A request that arrives with a traceparent must continue that trace.
+
+    The Flutter and browser SDKs put the header on every call. A server that
+    ignores it turns one user journey into two unrelated rows, and the timeline
+    that shows a tap causing database work does not exist.
+    """
+
+    from sentrinel_django.trace import parse_traceparent, traceparent_for  # noqa
+
+    def test_a_w3c_header_yields_the_trace_and_the_callers_span(self):
+        from sentrinel_django.trace import parse_traceparent
+
+        ctx = parse_traceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        assert ctx.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736"
+        assert ctx.parent_span_id == "00f067aa0ba902b7"
+
+    def test_the_tolerant_forms_match_the_node_plugin(self):
+        # The same header reaching a Node service and a Django service has to
+        # produce the same trace id, or the two halves still do not join.
+        from sentrinel_django.trace import parse_traceparent
+
+        assert parse_traceparent("4BF92F3577B34DA6A3CE929D0E0E4736").trace_id == "4bf92f3577b34da6a3ce929d0e0e4736"
+        assert parse_traceparent("4bf92f35-77b3-4da6-a3ce-929d0e0e4736").trace_id == "4bf92f3577b34da6a3ce929d0e0e4736"
+
+    def test_junk_is_ignored_rather_than_trusted(self):
+        from sentrinel_django.trace import parse_traceparent
+
+        for bad in ("", None, "nonsense", "00-short-00f067aa0ba902b7-01", "zz" * 16):
+            assert parse_traceparent(bad) is None
+
+    def test_the_header_we_send_is_parsed_by_our_own_parser(self):
+        from sentrinel_django.trace import generate_span_id, generate_trace_id, parse_traceparent, traceparent_for
+
+        t, s = generate_trace_id(), generate_span_id()
+        ctx = parse_traceparent(traceparent_for(t, s))
+        assert ctx.trace_id == t and ctx.parent_span_id == s
+
+    def test_ids_are_the_right_shape(self):
+        from sentrinel_django.trace import generate_span_id, generate_trace_id
+
+        assert len(generate_trace_id()) == 32 and len(generate_span_id()) == 16

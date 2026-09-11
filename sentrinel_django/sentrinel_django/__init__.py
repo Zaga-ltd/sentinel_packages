@@ -25,6 +25,7 @@ from .context import add_context, set_consumer
 from .logs import SentrinelLogHandler
 from .metrics import count, gauge, histogram, registry
 from .middleware import SentrinelMiddleware
+from .trace import parse_traceparent, traceparent_for
 
 __all__ = [
     "SentrinelMiddleware",
@@ -33,6 +34,8 @@ __all__ = [
     "set_consumer",
     "capture_exception",
     "count",
+    "current_trace",
+    "outgoing_headers",
     "gauge",
     "histogram",
     "flush",
@@ -112,6 +115,45 @@ def _route_of(request: Any) -> str:
         return route_for(request, path)
     except Exception:
         return path
+
+
+def current_trace() -> dict[str, str | None]:
+    """The trace this request belongs to, or empty outside one.
+
+    ``{"trace_id": …, "span_id": …, "parent_span_id": …}``. Useful for putting
+    the trace id in an error page or a support ticket, so a user's complaint
+    leads straight to the timeline.
+    """
+    from . import context
+
+    state = context.current() or {}
+    return {
+        "trace_id": state.get("trace_id"),
+        "span_id": state.get("span_id"),
+        "parent_span_id": state.get("parent_span_id"),
+    }
+
+
+def outgoing_headers(headers: dict[str, str] | None = None) -> dict[str, str]:
+    """Add this request's trace context to headers you are about to send.
+
+    The chain only continues if each service passes it on. A Django service
+    that reads `traceparent` and does not forward it joins the mobile app's
+    trace and then ends it, which looks like the downstream service never ran::
+
+        requests.post(url, json=payload, headers=outgoing_headers())
+
+    Outside a request this returns the headers unchanged — there is no trace to
+    propagate, and inventing one would create a root that belongs to nobody.
+    """
+    from . import context
+
+    out = dict(headers or {})
+    state = context.current()
+    if not state or not state.get("trace_id") or not state.get("span_id"):
+        return out
+    out.setdefault("traceparent", traceparent_for(state["trace_id"], state["span_id"]))
+    return out
 
 
 def flush() -> None:

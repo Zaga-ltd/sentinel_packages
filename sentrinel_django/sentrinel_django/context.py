@@ -14,11 +14,21 @@ from typing import Any
 _current: ContextVar[dict[str, Any] | None] = ContextVar("sentrinel_request", default=None)
 
 
-def begin(request_id: str | None = None, consumer: str | None = None, trace_id: str | None = None) -> dict[str, Any]:
+def begin(
+    request_id: str | None = None,
+    consumer: str | None = None,
+    trace_id: str | None = None,
+    span_id: str | None = None,
+    parent_span_id: str | None = None,
+) -> dict[str, Any]:
     state: dict[str, Any] = {
         "request_id": request_id or str(uuid.uuid4()),
         "consumer": consumer,
         "trace_id": trace_id,
+        # This request's own server span, and the caller's span when one sent a
+        # traceparent. Both travel on every log line written during the request.
+        "span_id": span_id,
+        "parent_span_id": parent_span_id,
         "logs": [],
         "attributes": {},
         "seq": 0,

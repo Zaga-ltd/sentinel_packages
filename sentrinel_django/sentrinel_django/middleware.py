@@ -21,6 +21,7 @@ from .config import Config, from_django_settings
 from .masking import mask_body, mask_mapping
 from .routes import route_for
 from .sampling import should_capture
+from .trace import generate_span_id, generate_trace_id, parse_traceparent, traceparent_for
 
 #: Header names Django exposes as META keys.
 _IP_HEADERS = ("HTTP_X_FORWARDED_FOR", "HTTP_X_REAL_IP", "REMOTE_ADDR")
@@ -87,7 +88,18 @@ class SentrinelMiddleware:
         if not self.config.configured or self._excluded(request):
             return self.get_response(request)
 
-        state = context.begin(consumer=self._consumer(request))
+        # A request that arrived with a traceparent continues that trace rather
+        # than starting a new one. Without this, a tap in the mobile app and the
+        # server work it caused are two unrelated rows, and the one timeline
+        # spanning both — the reason the SDKs send the header at all — does not
+        # exist.
+        incoming = parse_traceparent((getattr(request, "META", {}) or {}).get("HTTP_TRACEPARENT"))
+        state = context.begin(
+            consumer=self._consumer(request),
+            trace_id=incoming.trace_id if incoming else generate_trace_id(),
+            span_id=generate_span_id(),
+            parent_span_id=incoming.parent_span_id if incoming else None,
+        )
         started = time.perf_counter()
         request_body = self._read_request_body(request)
 

@@ -101,6 +101,8 @@ class SentrinelLogHandler(logging.Handler):
             line["consumerIdentifier"] = state.get("consumer")
             if state.get("trace_id"):
                 line["traceId"] = state["trace_id"]
+            if state.get("span_id"):
+                line["spanId"] = state["span_id"]
             line["seq"] = state["seq"]
             state["seq"] += 1
             # Held, not sent: the middleware stamps the consumer that the view
