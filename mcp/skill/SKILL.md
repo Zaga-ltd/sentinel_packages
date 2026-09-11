@@ -1,13 +1,38 @@
 ---
 name: sentrinel
-description: Read production telemetry from Sentrinel — issues (grouped errors), the exact HTTP requests that caused them, distributed traces, logs, and Postgres query/wait statistics — to diagnose a real bug or slowdown and fix it in the code at hand. Use whenever someone points at production ("what is erroring", "why is checkout slow", "fix the top issue", "did my fix work", "what did the request look like"), or when a local repro is missing and the failing input would settle it. Works through the Sentrinel MCP server or the `sentrinel` CLI.
+description: Work with Sentrinel, an error and performance monitor — read production telemetry (issues, the exact requests behind them, traces, logs, Postgres query and wait statistics) to diagnose a real bug or slowdown, and add or configure Sentrinel in an app (Elysia, Express, Next.js, Bun, browser, Django, Flutter/Dart, native mobile, Postgres). Use whenever someone points at production ("what is erroring", "why is checkout slow", "fix the top issue", "did my fix work"), asks to install, wire up, configure or debug Sentrinel itself, or asks which API key a thing needs. Reads go through the Sentrinel MCP server or the `sentrinel` CLI.
 ---
 
 # Sentrinel
 
-Sentrinel is an error and performance monitor. This skill is about using it as
-evidence: an agent that can read the exact request that broke production writes
-a fix and a regression test, instead of guessing from a stack trace.
+Sentrinel is an error and performance monitor. Two jobs come up, and they need
+different things from you:
+
+- **Reading production** — issues, the requests behind them, traces, logs,
+  database statistics. This is the larger half of the skill, and the point of
+  it is that an agent which can read the exact request that broke production
+  writes a fix and a regression test instead of guessing from a stack trace.
+- **Adding or configuring Sentrinel in an app** — the SDKs, their options, and
+  which key each one needs. Shapes and invariants are in
+  [references/integration.md](references/integration.md); keys are in
+  [references/keys.md](references/keys.md).
+
+## What this skill covers
+
+The public product: the SDKs, their configuration, the API keys, the dashboard
+and the tools below — everything documented at
+<https://docs.sentrinel.dev>. That is the whole of what you need and the whole
+of what you should rely on.
+
+It says nothing about how Sentrinel itself is built, hosted or deployed,
+because you do not need that to use it. If a question needs internals, say so
+rather than inferring them from behaviour — and never go looking for
+credentials, infrastructure or private repositories to answer it.
+
+When a configuration detail matters and you are not certain of it, read the
+docs page linked from the reference rather than guessing an option name: an
+invented config key does not error, it silently collects nothing, which is the
+worst failure a monitor can have.
 
 ## Do you have access?
 
@@ -20,7 +45,10 @@ Either surface works, and they return the same Markdown:
   `sentrinel` with no arguments for the full surface, or read
   [references/cli.md](references/cli.md).
 
-If neither is present, say so and stop. Do not invent a Sentrinel API call, do
+Neither is needed to *install* Sentrinel in an app — that is editing code and
+setting an environment variable, and works with no access at all.
+
+If neither is present and the task is to read production, say so and stop. Do not invent a Sentrinel API call, do
 not `curl` the API by hand, and do not ask the user to paste their API key
 anywhere — installation is one line and is documented at
 <https://docs.sentrinel.dev/reference/mcp/>.

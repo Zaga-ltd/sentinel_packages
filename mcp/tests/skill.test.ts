@@ -20,6 +20,8 @@ describe("the generated content", () => {
       "SKILL.md",
       "references/cli.md",
       "references/databases.md",
+      "references/integration.md",
+      "references/keys.md",
     ]);
   });
 
@@ -44,7 +46,7 @@ describe("the generated content", () => {
 
 describe("frontmatter", () => {
   it("reads the description out", () => {
-    expect(description()).toStartWith("Read production telemetry from Sentrinel");
+    expect(description()).toStartWith("Work with Sentrinel, an error and performance monitor");
   });
 
   it("strips it for formats that do not use it", () => {
@@ -69,6 +71,8 @@ describe("plan", () => {
       "/home/dev/.claude/skills/sentrinel/SKILL.md",
       "/home/dev/.claude/skills/sentrinel/references/cli.md",
       "/home/dev/.claude/skills/sentrinel/references/databases.md",
+      "/home/dev/.claude/skills/sentrinel/references/integration.md",
+      "/home/dev/.claude/skills/sentrinel/references/keys.md",
     ]);
   });
 
@@ -120,7 +124,7 @@ describe("mergeBlock", () => {
 describe("cursorRule", () => {
   it("is a single self-contained document", () => {
     const r = cursorRule();
-    expect(r).toStartWith("---\ndescription: Read production telemetry");
+    expect(r).toStartWith("---\ndescription: Work with Sentrinel");
     expect(r).toContain("# Sentrinel");
     expect(r).toContain("list_issues");
   });
@@ -159,5 +163,55 @@ describe("links in the single-file forms", () => {
   it("keeps them relative in the installed skill, where the files are real", () => {
     const [main] = plan({ ...opts, install: true }).files;
     expect(main.content).toContain("](references/cli.md)");
+  });
+});
+
+// The skill is published — to the public package repo, to sentrinel.dev, and
+// into whatever repository a user installs it in. It documents the product, so
+// nothing about how the product is built or hosted belongs in it, and no
+// credential-shaped string ever does.
+describe("the public/internal boundary", () => {
+  const all = Object.values(SKILL_FILES).join("\n");
+
+  it("names no internal host, service or private repository", () => {
+    for (const forbidden of [
+      "dokploy",
+      "clickhouse",
+      "redpanda",
+      "elysia-monitoring",
+      ".env.deploy",
+      "wrangler",
+      "cloudflare",
+      "drizzle",
+      "sentrinel-db",
+    ]) {
+      expect(all.toLowerCase()).not.toContain(forbidden);
+    }
+  });
+
+  it("names no raw IP address", () => {
+    expect(all).not.toMatch(/\b\d{1,3}(\.\d{1,3}){3}\b/);
+  });
+
+  // Prefixes are documented on purpose — a whole key never is.
+  it("contains no key-shaped string", () => {
+    expect(all).not.toMatch(/snt_[a-z]+_[A-Za-z0-9]{8,}/);
+  });
+
+  it("points at the public docs for the detail it does not carry", () => {
+    expect(SKILL_FILES["references/integration.md"]).toContain("https://docs.sentrinel.dev/reference/");
+    expect(SKILL_FILES["SKILL.md"]).toContain("https://docs.sentrinel.dev");
+  });
+
+  it("covers every SDK someone might be integrating", () => {
+    const i = SKILL_FILES["references/integration.md"];
+    for (const platform of ["Elysia", "Express", "Next.js", "Bun", "Django", "Flutter", "Postgres", "browser"]) {
+      expect(i).toContain(platform);
+    }
+  });
+
+  it("says where the key goes, in both references", () => {
+    expect(SKILL_FILES["references/keys.md"]).toContain("Never on a command line");
+    expect(SKILL_FILES["references/integration.md"]).toContain("never in a commit");
   });
 });
