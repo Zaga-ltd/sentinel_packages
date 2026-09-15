@@ -275,6 +275,11 @@ export function sentrinelPlugin(options: SentrinelPluginOptions) {
 
         // Check if this path is excluded
         if (excludePatterns.some((p) => p.test(pathname))) return;
+        try {
+          if (options.excludeRequest?.(ctx.request)) return;
+        } catch {
+          // A predicate that throws excludes nothing; telemetry is best-effort.
+        }
 
         // Determine the route pattern (use Elysia's matched route if available)
         const routePath = (ctx as any).route || pathname;

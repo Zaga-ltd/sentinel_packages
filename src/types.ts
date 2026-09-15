@@ -93,6 +93,16 @@ export interface SentrinelPluginOptions {
 
   /** Paths to exclude from monitoring (regex patterns) */
   excludePaths?: (string | RegExp)[];
+  /**
+   * Skip a request entirely, decided from the request itself.
+   *
+   * `excludePaths` covers what a path can express — health checks, static
+   * files. This covers what it cannot: a server that monitors itself must not
+   * record the reports it posts to itself, and those are told apart by the key
+   * they carry, not by their route. Recording them makes each report produce
+   * another, and the count grows on every flush.
+   */
+  excludeRequest?: (request: Request) => boolean;
 
   /** Enable debug logging */
   debug?: boolean;
