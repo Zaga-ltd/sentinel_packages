@@ -20,7 +20,8 @@ MIDDLEWARE = [
 
 SENTRINEL = {
     "SERVER_URL": "https://api.sentrinel.dev",
-    "APP_NAME": "orders",
+    "APP_NAME": "orders",                          # the project
+    "MODULE": "api",                               # which part of it this service is
     "ENV": "prod",
     "API_KEY": os.environ["SENTRINEL_API_KEY"],   # a Server key
 }

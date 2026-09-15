@@ -4,9 +4,12 @@ Everything in a JavaScript bundle is public, so the browser SDK holds **no API
 key**. It posts batches to your own server, and your server forwards them with
 the key. This is that endpoint, in one URL line.
 
-It also pins `appName` and `env` server-side, ignoring whatever the batch
-claims. Without that, anyone who found the URL could write telemetry into a
-different app in your account.
+It also pins `appName`, `env` and `module` server-side, ignoring whatever the
+batch claims. Without that, anyone who found the URL could write telemetry into
+a different app in your account, or label it as a different part of this one.
+The part is `TUNNEL_MODULE` ("web" unless set), not this server's `MODULE`: the
+page and the server are two parts of one project, and a batch through here is
+always the page's.
 """
 
 from __future__ import annotations
@@ -81,8 +84,8 @@ def sentrinel_tunnel(request: Any) -> Any:
             continue
         # appName and env come from settings, never from the batch.
         head = {"appName": cfg.app_name, "env": cfg.env}
-        if cfg.module:
-            head["module"] = cfg.module
+        if cfg.tunnel_module:
+            head["module"] = cfg.tunnel_module
         collector._post(path, {**head, key: rows})
         forwarded += len(rows) if isinstance(rows, list) else 1
 

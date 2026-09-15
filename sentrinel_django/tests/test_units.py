@@ -126,6 +126,23 @@ class TestConfig:
         cfg = load({"SERVER_URL": "http://x"})
         assert cfg.api_key == "snt_live_abc" and cfg.app_name == "from-env"
 
+    def test_the_module_says_which_part_of_the_project_this_service_is(self, monkeypatch):
+        # An app is the whole project; MODULE names this service within it.
+        # Unset, nothing is sent and the server names the part after the key.
+        assert load({"SERVER_URL": "http://x", "APP_NAME": "shop"}).module == ""
+        assert load({"SERVER_URL": "http://x", "APP_NAME": "shop", "MODULE": "api"}).module == "api"
+        monkeypatch.setenv("SENTRINEL_MODULE", "worker")
+        assert load({"SERVER_URL": "http://x", "APP_NAME": "shop"}).module == "worker"
+        # Settings win over the environment, as for every other value.
+        assert load({"SERVER_URL": "http://x", "APP_NAME": "shop", "MODULE": "api"}).module == "api"
+
+    def test_the_tunnel_labels_the_page_as_its_own_part(self, monkeypatch):
+        # The browser is not the server that forwards for it.
+        assert load({"SERVER_URL": "http://x", "APP_NAME": "shop", "MODULE": "api"}).tunnel_module == "web"
+        assert load({"SERVER_URL": "http://x", "APP_NAME": "shop", "TUNNEL_MODULE": "admin"}).tunnel_module == "admin"
+        monkeypatch.setenv("SENTRINEL_TUNNEL_MODULE", "storefront")
+        assert load({"SERVER_URL": "http://x", "APP_NAME": "shop"}).tunnel_module == "storefront"
+
 
 class TestMetrics:
     def setup_method(self):

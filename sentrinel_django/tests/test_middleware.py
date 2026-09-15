@@ -573,12 +573,96 @@ class TestTunnel:
         body = sent.payload("/api/ingest/errors")
         assert body["appName"] == "orders"
 
+    def test_the_page_is_labelled_as_its_own_part_never_the_servers(self, build, sent):
+        from sentrinel_django import sentrinel_tunnel
+
+        # This server is the "api" part of the project. A batch through the
+        # tunnel came from the page, which is another part — labelling it "api"
+        # would file every browser request under the backend.
+        build(MODULE="api")
+        sentrinel_tunnel(self._post({"requests": [{"p": "/"}], "module": "someone-elses-part"}))
+        body = sent.payload("/api/ingest/requests")
+        assert body["module"] == "web"
+        assert body["appName"] == "orders"
+
+    def test_the_pages_part_can_be_named(self, build, sent):
+        from sentrinel_django import sentrinel_tunnel
+
+        build(MODULE="api", TUNNEL_MODULE="admin")
+        sentrinel_tunnel(self._post({"errors": [{"m": 1}]}))
+        assert sent.payload("/api/ingest/errors")["module"] == "admin"
+
     def test_junk_is_refused(self, build):
         from sentrinel_django import sentrinel_tunnel
 
         build()
         assert sentrinel_tunnel(rf.get("/api/_sentrinel")).status_code == 405
         assert sentrinel_tunnel(rf.post("/api/_sentrinel", data=b"not json", content_type="application/json")).status_code == 400
+
+
+class TestModule:
+    """An app is the project; MODULE says which part of it this service is.
+
+    Every payload has to carry it — a request labelled "api" whose error or log
+    line was not would split one service into two parts on the dashboard.
+    """
+
+    PATHS = (
+        "/api/ingest/requests",
+        "/api/ingest/metrics",
+        "/api/ingest/logs",
+        "/api/ingest/errors",
+        "/api/ingest/traces",
+        "/api/ingest/custom-metrics",
+    )
+
+    def _everything(self, build, sent, **overrides):
+        import logging
+
+        from django.http import HttpResponse
+
+        from sentrinel_django import SentrinelLogHandler, count, span
+
+        handler = SentrinelLogHandler()
+        logger = logging.getLogger("shop.module")
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+
+        def view(request):
+            if request.path == "/boom/":
+                raise ValueError("kaboom")
+            logger.info("hello")
+            with span("db.query"):
+                pass
+            count("orders.viewed")
+            return HttpResponse("ok")
+
+        try:
+            mw = build(view, **overrides)
+            mw(rf.get("/ok/"))
+            request = rf.get("/boom/")
+            with pytest.raises(ValueError):
+                mw(request)
+            mw.process_exception(request, ValueError("kaboom"))
+            mw.collector.flush()
+        finally:
+            logger.removeHandler(handler)
+
+        bodies = {path: body for path, body in sent.posts}
+        assert set(self.PATHS) <= set(bodies), sorted(bodies)
+        return bodies
+
+    def test_every_payload_says_which_part_sent_it(self, build, sent):
+        bodies = self._everything(build, sent, MODULE="api")
+        for path in self.PATHS:
+            assert bodies[path]["module"] == "api", path
+            # The project is unchanged by naming a part of it.
+            assert bodies[path]["appName"] == "orders", path
+
+    def test_unset_nothing_is_sent_so_the_key_names_the_part(self, build, sent):
+        bodies = self._everything(build, sent)
+        for path in self.PATHS:
+            assert "module" not in bodies[path], path
 
 
 class TestOutbound:

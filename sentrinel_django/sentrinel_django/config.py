@@ -71,6 +71,10 @@ class Config:
     #: Which part of the project this is — "api", "admin". An app is the whole
     #: project; each service reports as a module of it. Empty uses the key's name.
     module: str = ""
+    #: The part a browser batch through the tunnel is labelled as. The page is a
+    #: different part of the project from the server forwarding for it — it is
+    #: not "api" because it posts to the API — so this is its own setting.
+    tunnel_module: str = "web"
     env: str = "dev"
     api_key: str = ""
     version: str | None = None
@@ -146,6 +150,7 @@ def load(settings_dict: dict[str, Any] | None = None) -> Config:
         server_url=str(pick("SERVER_URL", "SENTRINEL_SERVER_URL", "") or "").rstrip("/"),
         app_name=str(pick("APP_NAME", "SENTRINEL_APP_NAME", "") or ""),
         module=str(pick("MODULE", "SENTRINEL_MODULE", "") or ""),
+        tunnel_module=str(pick("TUNNEL_MODULE", "SENTRINEL_TUNNEL_MODULE", "web") or ""),
         env=str(pick("ENV", "SENTRINEL_ENV", "dev") or "dev"),
         api_key=str(pick("API_KEY", "SENTRINEL_API_KEY", "") or ""),
         version=pick("VERSION", "SENTRINEL_VERSION", None),
