@@ -255,7 +255,10 @@ class Collector:
             self._post("/api/ingest/custom-metrics", payload)
 
     def _envelope(self, **body: Any) -> dict[str, Any]:
-        return {"appName": self.config.app_name, "env": self.config.env, **body}
+        head = {"appName": self.config.app_name, "env": self.config.env}
+        if self.config.module:
+            head["module"] = self.config.module
+        return {**head, **body}
 
     def _metrics_payload(
         self, endpoints: dict[tuple[str, str], dict[str, Any]], consumers: dict[Any, dict[str, Any]]

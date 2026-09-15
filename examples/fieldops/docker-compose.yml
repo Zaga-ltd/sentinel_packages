@@ -1,0 +1,27 @@
+# The database part of FieldOps.
+#
+# The backend keeps its data in memory so the example runs with nothing else
+# installed; this Postgres is here so the project's database module has
+# something real to watch. pg_stat_statements is preloaded because the
+# collector's query view is built on it.
+#
+#   docker compose -f examples/fieldops/docker-compose.yml up -d
+#
+# Local demo credentials only.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fieldops
+      POSTGRES_PASSWORD: fieldops
+      POSTGRES_DB: fieldops
+    ports:
+      - "5433:5432"
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+    volumes:
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-init.sql:ro

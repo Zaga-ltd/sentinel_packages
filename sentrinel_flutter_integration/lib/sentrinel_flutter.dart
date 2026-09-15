@@ -51,6 +51,7 @@ class SentrinelOptions {
     required this.appName,
     this.env = 'prod',
     this.apiKey,
+    this.module,
     this.release,
     this.consumerIdentifier,
     this.flushInterval = const Duration(seconds: 30),
@@ -62,6 +63,9 @@ class SentrinelOptions {
   final String appName;
   final String env;
   final String? apiKey;
+
+  /// Which part of the project this app is. See `Sentrinel.init`.
+  final String? module;
 
   /// The build. Crash-free rate is per release; without it every build is
   /// "unknown" and a regression is invisible.
@@ -113,6 +117,7 @@ class SentrinelFlutter {
       appName: options.appName,
       env: options.env,
       apiKey: options.apiKey,
+      module: options.module,
       release: options.release,
       consumerIdentifier: options.consumerIdentifier,
       flushInterval: options.flushInterval,

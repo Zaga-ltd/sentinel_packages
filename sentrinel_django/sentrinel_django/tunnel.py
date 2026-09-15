@@ -80,7 +80,10 @@ def sentrinel_tunnel(request: Any) -> Any:
         if not rows:
             continue
         # appName and env come from settings, never from the batch.
-        collector._post(path, {"appName": cfg.app_name, "env": cfg.env, key: rows})
+        head = {"appName": cfg.app_name, "env": cfg.env}
+        if cfg.module:
+            head["module"] = cfg.module
+        collector._post(path, {**head, key: rows})
         forwarded += len(rows) if isinstance(rows, list) else 1
 
     return JsonResponse({"ok": True, "forwarded": forwarded})

@@ -8,6 +8,7 @@ import type {
   ErrorPayload,
   AppLogsPayload,
 } from "./types";
+import { normaliseRoutePath } from "./route-path";
 import { RetryQueue } from "./retry";
 import { metricRegistry } from "./metrics";
 import { hostname } from "node:os";
@@ -101,7 +102,12 @@ export class MetricsCollector {
     consumerName?: string;
     consumerGroup?: string;
   }): void {
-    const key = `${data.method}:${data.path}`;
+    // Ids collapsed before this becomes a key. Without it the map grows one
+    // entry per request between flushes, and a batch carrying more than 2,000
+    // endpoints is refused with a 413 — the whole flush lost, for exactly the
+    // apps with the most traffic.
+    const route = normaliseRoutePath(data.path);
+    const key = `${data.method}:${route}`;
     const isError = data.statusCode >= 400;
 
     // Aggregate endpoint metrics
@@ -109,7 +115,7 @@ export class MetricsCollector {
     if (!metrics) {
       metrics = {
         method: data.method,
-        path: data.path,
+        path: route,
         requestCount: 0,
         successCount: 0,
         errorCount: 0,
@@ -133,7 +139,9 @@ export class MetricsCollector {
 
     // Aggregate consumer metrics
     if (data.consumerIdentifier) {
-      const consumerKey = `${data.consumerIdentifier}:${data.method}:${data.path}`;
+      // Same route identity as the endpoint map above — this one is capped at
+      // 5,000 per batch, and it multiplies by consumer.
+      const consumerKey = `${data.consumerIdentifier}:${data.method}:${route}`;
       let cMetrics = this.consumerMetrics.get(consumerKey);
       if (!cMetrics) {
         cMetrics = {
@@ -141,7 +149,7 @@ export class MetricsCollector {
           consumerName: data.consumerName,
           consumerGroup: data.consumerGroup,
           method: data.method,
-          path: data.path,
+          path: route,
           requestCount: 0,
           errorCount: 0,
           totalResponseTime: 0,
@@ -199,6 +207,7 @@ export class MetricsCollector {
         this.requestLogBuffer = [];
         const payload: RequestLogsPayload = {
           appName: this.options.appName,
+          module: this.options.module,
           env: this.options.env || "dev",
           requests: logs,
         };
@@ -210,6 +219,7 @@ export class MetricsCollector {
         const logs = this.appLogBuffer.splice(0, this.appLogBuffer.length);
         const payload: AppLogsPayload = {
           appName: this.options.appName,
+          module: this.options.module,
           env: this.options.env || "dev",
           logs,
         };
@@ -222,6 +232,7 @@ export class MetricsCollector {
         this.errorBuffer = [];
         const payload: ErrorPayload = {
           appName: this.options.appName,
+          module: this.options.module,
           env: this.options.env || "dev",
           errors,
         };
@@ -236,6 +247,7 @@ export class MetricsCollector {
           promises.push(
             this.sendToServer("/api/ingest/traces", {
               appName: this.options.appName,
+              module: this.options.module,
               env: this.options.env || "dev",
               ...trace,
             })
@@ -251,6 +263,7 @@ export class MetricsCollector {
         promises.push(
           this.sendToServer("/api/ingest/custom-metrics", {
             appName: this.options.appName,
+            module: this.options.module,
             env: this.options.env || "dev",
             version: this.options.version,
             metrics: points,
@@ -347,6 +360,7 @@ export class MetricsCollector {
 
     return {
       appName: this.options.appName,
+      module: this.options.module,
       env: this.options.env || "dev",
       // Reported every flush; the server dedupes and only records changes.
       version: this.options.version,
@@ -394,8 +408,8 @@ export class MetricsCollector {
         if (res.status === 401 || res.status === 403) {
           this.warnOnce(
             `${path}`,
-            `telemetry rejected (${res.status}). Check apiKey, appName and env — ` +
-              `the key must belong to this app and environment. Server said: ${detail}`
+            `telemetry rejected (${res.status}). Check apiKey and env — ` +
+              `the key must be issued for this environment. Server said: ${detail}`
           );
         } else if (res.status === 429) {
           this.warnOnce(`${path}`, `over quota (429) — telemetry is being dropped. ${detail}`);

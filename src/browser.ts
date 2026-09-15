@@ -135,6 +135,11 @@ export interface BrowserRequest {
   queryParams?: Record<string, string>;
   errorMessage?: string;
   traceId?: string;
+  /**
+   * The span id in the traceparent this page sent: the parent the backend's span
+   * continues. Present only when the SDK set the header itself.
+   */
+  spanId?: string;
   attributes?: Record<string, unknown>;
   timestamp: string;
   sampleRate?: number;
@@ -724,6 +729,10 @@ class BrowserClient implements SentrinelBrowser {
 
       const started = now();
       const traceId = randomId(32);
+      // Kept, not thrown away: it is the parent the backend's span points at, so
+      // the click can be put on the trace as the span everything else hangs off.
+      const spanId = randomId(16);
+      let propagated = false;
       let headers = init?.headers;
 
       if (this.shouldPropagate(url)) {
@@ -731,7 +740,8 @@ class BrowserClient implements SentrinelBrowser {
         // its own, which is what puts the click and the handler on one waterfall.
         const merged = new Headers(headers ?? (input instanceof Request ? input.headers : undefined));
         if (!merged.has("traceparent")) {
-          merged.set("traceparent", `00-${traceId}-${randomId(16)}-01`);
+          merged.set("traceparent", `00-${traceId}-${spanId}-01`);
+          propagated = true;
         }
         headers = merged;
         init = { ...init, headers };
@@ -739,7 +749,7 @@ class BrowserClient implements SentrinelBrowser {
 
       try {
         const response = await original(input, init as RequestInit);
-        this.recordRequest({ url, method, status: response.status, started, traceId });
+        this.recordRequest({ url, method, status: response.status, started, traceId, spanId: propagated ? spanId : undefined });
         return response;
       } catch (err) {
         // A network failure never reached a server, so there is no status.
@@ -749,6 +759,7 @@ class BrowserClient implements SentrinelBrowser {
           status: 0,
           started,
           traceId,
+          spanId: propagated ? spanId : undefined,
           error: (err as Error)?.message ?? String(err),
         });
         throw err;
@@ -786,6 +797,7 @@ class BrowserClient implements SentrinelBrowser {
     status: number;
     started: number;
     traceId: string;
+    spanId?: string;
     error?: string;
   }): void {
     const ms = now() - args.started;
@@ -816,6 +828,7 @@ class BrowserClient implements SentrinelBrowser {
       queryParams: queryOf(args.url),
       errorMessage: args.error,
       traceId: args.traceId,
+      spanId: args.spanId,
       timestamp: new Date(Date.now() - ms).toISOString(),
       sampleRate: failed || slow ? 1 : this.opts.sampleRate,
       attributes: {
@@ -1022,7 +1035,7 @@ class BrowserClient implements SentrinelBrowser {
         this.warnOnce(
           String(res.status),
           `telemetry rejected (${res.status}). Check that ${url} is reachable and that ` +
-            `the tunnel's apiKey, appName and env match.`
+            `the tunnel's apiKey and env match.`
         );
         return;
       }

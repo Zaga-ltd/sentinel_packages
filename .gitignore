@@ -2,6 +2,10 @@ node_modules/
 *.log
 sentrinel_flutter/.dart_tool/
 sentrinel_flutter/pubspec.lock
+examples/fieldops/mobile/build/
+examples/fieldops/mobile/.dart_tool/
+examples/fieldops/mobile/pubspec.lock
+examples/fieldops/node_modules/
 __pycache__/
 *.py[cod]
 .pytest_cache/

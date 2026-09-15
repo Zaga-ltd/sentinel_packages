@@ -68,6 +68,9 @@ def _compile(patterns: Iterable[Any]) -> list[Pattern[str]]:
 class Config:
     server_url: str = ""
     app_name: str = ""
+    #: Which part of the project this is — "api", "admin". An app is the whole
+    #: project; each service reports as a module of it. Empty uses the key's name.
+    module: str = ""
     env: str = "dev"
     api_key: str = ""
     version: str | None = None
@@ -142,6 +145,7 @@ def load(settings_dict: dict[str, Any] | None = None) -> Config:
     cfg = Config(
         server_url=str(pick("SERVER_URL", "SENTRINEL_SERVER_URL", "") or "").rstrip("/"),
         app_name=str(pick("APP_NAME", "SENTRINEL_APP_NAME", "") or ""),
+        module=str(pick("MODULE", "SENTRINEL_MODULE", "") or ""),
         env=str(pick("ENV", "SENTRINEL_ENV", "dev") or "dev"),
         api_key=str(pick("API_KEY", "SENTRINEL_API_KEY", "") or ""),
         version=pick("VERSION", "SENTRINEL_VERSION", None),

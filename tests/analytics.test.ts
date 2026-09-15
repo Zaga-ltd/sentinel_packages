@@ -56,8 +56,17 @@ function fakeFetch() {
 
 let dom: ReturnType<typeof installDom>;
 
+// installDom() and the fake fetch are written onto globalThis, which outlives
+// this file: bun runs the suite in one process, so anything left behind is
+// still there for every test that comes after. Leaving `fetch` stubbed made
+// the notifier's webhook tests pass their delivery assertion and then find an
+// empty receiver — the stub answered 202 without a request ever being sent.
+const GLOBALS = ["fetch", "window", "document", "navigator", "location", "history"] as const;
+let saved: Record<string, unknown> = {};
+
 beforeEach(() => {
   sent = [];
+  saved = Object.fromEntries(GLOBALS.map((k) => [k, (globalThis as any)[k]]));
   dom = installDom();
   (globalThis as any).fetch = fakeFetch();
   resetSentrinelBrowser();
@@ -65,6 +74,13 @@ beforeEach(() => {
 
 afterEach(() => {
   resetSentrinelBrowser();
+  for (const k of GLOBALS) {
+    // Deleting rather than assigning undefined: `typeof window === "undefined"`
+    // is how the code under test detects a non-browser environment, and an
+    // own property set to undefined is still an own property.
+    if (saved[k] === undefined) delete (globalThis as any)[k];
+    else (globalThis as any)[k] = saved[k];
+  }
 });
 
 function boot(options: Record<string, unknown> = {}) {

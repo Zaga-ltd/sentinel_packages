@@ -13,6 +13,19 @@ export interface SentrinelPluginOptions {
   /** API key for authentication with the Sentrinel server */
   apiKey?: string;
 
+  /**
+   * Which part of your project this is — "backend", "worker", "auth-service".
+   *
+   * An app in Sentrinel is the whole project: your backend, your mobile app and
+   * your web client are one app, so a request can be followed from the phone to
+   * the query it ended in. This names the part.
+   *
+   * Optional. Without it the part is taken from the API key's name, which is
+   * what you want when each part has its own key. Set it when several services
+   * share one key, so they can still be told apart.
+   */
+  module?: string;
+
   /** Flush interval in milliseconds (default: 30000) */
   flushInterval?: number;
 
@@ -206,6 +219,8 @@ export interface RequestLogEntry {
 
 export interface MetricsPayload {
   appName: string;
+  /** Which part of the project sent this. Defaults to the key's name. */
+  module?: string;
   env: string;
   /** App version, when configured — drives deploy markers. */
   version?: string;
@@ -248,12 +263,16 @@ export interface MetricsPayload {
 
 export interface RequestLogsPayload {
   appName: string;
+  /** Which part of the project sent this. Defaults to the key's name. */
+  module?: string;
   env: string;
   requests: RequestLogEntry[];
 }
 
 export interface AppLogsPayload {
   appName: string;
+  /** Which part of the project sent this. Defaults to the key's name. */
+  module?: string;
   env: string;
   logs: Array<{
     timestamp: string;
@@ -282,6 +301,8 @@ export interface AppLogsPayload {
 
 export interface ErrorPayload {
   appName: string;
+  /** Which part of the project sent this. Defaults to the key's name. */
+  module?: string;
   env: string;
   errors: {
     method: string;

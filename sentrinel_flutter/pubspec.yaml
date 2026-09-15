@@ -4,7 +4,7 @@ description: >-
   uncaught Dart errors as crashes that survive the process, and propagates W3C
   traceparent so a mobile call and the backend request it triggers land on one
   timeline. Native iOS/Android crashes are not covered.
-version: 0.1.0
+version: 0.2.0
 repository: https://github.com/Zaga-ltd/sentinel_packages
 homepage: https://sentrinel.dev
 

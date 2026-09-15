@@ -1,0 +1,32 @@
+name: fieldops_mobile
+description: "FieldOps technician app — the Flutter half of the Sentrinel end-to-end demo."
+publish_to: 'none'
+
+# Crash-free rate is reported per release, so this version string is the thing
+# that makes a regression visible between builds. Bump it when you ship.
+version: 2.4.0+24
+
+environment:
+  sdk: ^3.9.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  http: ^1.2.0
+  path_provider: ^2.1.4
+
+  # Both SDKs by path — this app lives in the same repository they do. A
+  # shipping app takes the GitHub ref instead; see packages/*/pubspec.yaml.
+  sentrinel:
+    path: ../../../sentrinel_flutter
+  sentrinel_flutter:
+    path: ../../../sentrinel_flutter_integration
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

@@ -10,6 +10,7 @@ agent skill, one repo.
 | [`sentrinel_flutter_integration/`](sentrinel_flutter_integration) | Flutter apps | a `git:` dependency — see below |
 | [`mcp/`](mcp) | Claude Code, Codex and other agents | `curl -fsSL https://sentrinel.dev/install-mcp.sh \| bash` |
 | [`mcp/skill/`](mcp/skill) | the agent skill — how to use those tools well | `sentrinel skill install [--cursor\|--agents]` |
+| [`examples/fieldops/`](examples/fieldops) | a whole project — backend, Flutter app, web console, Postgres, agent — as **one** app, one trace from tap to query | see its README |
 
 **None of these are on npm, PyPI or pub.dev yet.** Every command above installs
 from this repository, which is why each one names it.

@@ -57,6 +57,7 @@ export 'src/isolate_hook.dart' show isolateErrorPort;
 export 'src/models.dart'
     show RequestRecord, ErrorRecord, LogRecord, SessionRecord, SpanRecord;
 export 'src/trace.dart' show TraceContext, generateTraceId, generateSpanId;
+export 'src/metrics.dart' show MetricRegistry, kMaxSeries, kMaxSamples;
 
 /// The entry point. One instance per app.
 class Sentrinel {
@@ -99,6 +100,12 @@ class Sentrinel {
     required String appName,
     String env = 'prod',
     String? apiKey,
+
+    /// Which part of the project this is. An app in Sentrinel is the whole
+    /// project — the phone, the backend, the web client — and each reports as
+    /// a module of it, so one request can be followed across all of them.
+    /// Unset, the API key's name is used.
+    String? module,
     Duration flushInterval = const Duration(seconds: 30),
     /// Identifies this client in Consumers — a user id, a tenant, a build
     /// channel. Whatever you want to slice traffic by.
@@ -136,6 +143,7 @@ class Sentrinel {
       appName: appName,
       env: env,
       apiKey: apiKey,
+      module: module,
       flushInterval: flushInterval,
       client: httpClient,
     )..start();
@@ -261,6 +269,30 @@ class Sentrinel {
       sessionId: _sessionId,
     ));
   }
+
+  // ── Custom metrics ──
+  //
+  // The numbers only this app knows: videos watched, seconds buffered, items
+  // added. Increments fold in memory and leave as one row per series per
+  // flush, so calling these in a build method or a scroll listener is a normal
+  // thing to do rather than something to be careful about.
+
+  /// Add to a running total: items sold, retries, videos started.
+  static void count(String name, [num value = 1, Map<String, Object?>? labels, String? unit]) =>
+      _collector?.metrics.record(name, 'counter', value, labels: labels, unit: unit);
+
+  /// Report a level that goes up and down: queue depth, cache size.
+  ///
+  /// The last value in a flush window wins — a gauge is a reading, not a total.
+  static void gauge(String name, num value, [Map<String, Object?>? labels, String? unit]) =>
+      _collector?.metrics.record(name, 'gauge', value, labels: labels, unit: unit);
+
+  /// Record a distribution: time to first frame of a video, payload size.
+  ///
+  /// Percentiles come back with it, which is the point — an average hides the
+  /// one user whose experience was fifty times worse.
+  static void histogram(String name, num value, [Map<String, Object?>? labels, String? unit]) =>
+      _collector?.metrics.record(name, 'histogram', value, labels: labels, unit: unit);
 
   /// The id product events are attributed to before anyone signs in.
   static String? get anonymousId => _anonymousId;

@@ -110,6 +110,33 @@ void main() {
       expect(DateTime.parse(row['timestamp'] as String), isA<DateTime>());
     });
 
+    // An app is the whole project; the phone is one part of it. The module is
+    // what tells its rows apart from the backend's inside that one app.
+    test('the module names which part of the project sent it', () async {
+      Sentrinel.init(
+        serverUrl: 'https://api.test',
+        appName: 'fieldops',
+        module: 'mobile',
+        httpClient: captured.client(),
+      );
+      final app = SentrinelHttpClient(MockClient((_) async => http.Response('{}', 200)));
+      await app.get(Uri.parse('https://example.com/v1/orders'));
+      await Sentrinel.flush();
+
+      final body = captured.byPath['/api/ingest/requests']!.single;
+      expect(body['appName'], 'fieldops');
+      expect(body['module'], 'mobile');
+    });
+
+    test('with no module set, none is sent and the key names the part', () async {
+      Sentrinel.init(serverUrl: 'https://api.test', appName: 'fieldops', httpClient: captured.client());
+      final app = SentrinelHttpClient(MockClient((_) async => http.Response('{}', 200)));
+      await app.get(Uri.parse('https://example.com/v1/orders'));
+      await Sentrinel.flush();
+
+      expect(captured.byPath['/api/ingest/requests']!.single.containsKey('module'), isFalse);
+    });
+
     test('the outgoing request carries traceparent for the backend to continue', () async {
       Sentrinel.init(
         serverUrl: 'https://api.test',

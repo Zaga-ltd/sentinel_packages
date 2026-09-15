@@ -495,6 +495,32 @@ describe("tunnel", () => {
     expect(consumers[0].identifier).toBe("real-user-42");
   });
 
+  test("a call the page propagated becomes the client span its trace starts with", async () => {
+    const tunnel = createSentrinelTunnel(opts);
+    const traceId = "a".repeat(32);
+    await tunnel(
+      post({
+        requests: [
+          { id: "r1", method: "POST", path: "/api/v1/jobs/1/complete", statusCode: 200, responseTime: 42,
+            timestamp: new Date().toISOString(), traceId, spanId: "b".repeat(16) },
+          // Not propagated (no spanId): nothing for the backend to continue.
+          { id: "r2", method: "GET", path: "/cdn/logo.svg", statusCode: 200, responseTime: 3,
+            timestamp: new Date().toISOString(), traceId: "c".repeat(32) },
+        ],
+      })
+    );
+
+    const traces = captured.filter((c) => c.url.endsWith("/api/ingest/traces"));
+    expect(traces).toHaveLength(1);
+    expect(traces[0].body.traceId).toBe(traceId);
+    expect(traces[0].body.appName).toBe("admin");
+    const [span] = traces[0].body.spans as any[];
+    // The id the backend's span names as its parent, or the two never join.
+    expect(span.id).toBe("b".repeat(16));
+    expect(span.kind).toBe("CLIENT");
+    expect(span.attributes["sentrinel.source"]).toBe("browser");
+  });
+
   test("appName and env come from the server, never the browser", async () => {
     const tunnel = createSentrinelTunnel(opts);
     // A hostile page claiming to be someone else's app.

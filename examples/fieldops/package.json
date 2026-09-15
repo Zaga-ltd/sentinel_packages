@@ -1,0 +1,14 @@
+{
+  "name": "fieldops-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "backend": "bun run backend/server.ts",
+    "web": "bun run web/server.ts",
+    "simulate": "bun run simulate.ts"
+  },
+  "dependencies": {
+    "@sentrinel/plugin": "github:Zaga-ltd/sentinel_packages",
+    "elysia": "^1.4.0"
+  }
+}

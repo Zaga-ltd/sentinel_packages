@@ -40,6 +40,12 @@ export interface SentrinelTunnelOptions {
   /** Falls back to the release the browser reported. */
   release?: string;
   /**
+   * Which part of the project this page is — `web`, `admin`, `checkout`. An app
+   * is the whole project; the browser reports as a module of it beside the
+   * backend and the phone. Defaults to the key's name.
+   */
+  module?: string;
+  /**
    * Largest batch accepted, in bytes. An open endpoint that will buffer
    * anything is a memory-exhaustion target.
    */
@@ -74,6 +80,45 @@ export interface TunnelBatch {
 const DEFAULT_MAX_BODY = 512 * 1024;
 
 /**
+ * Client spans forwarded per batch. Each is its own ingest call (a trace and
+ * its spans travel together), so a page firing hundreds of calls between
+ * flushes must not fan out into hundreds of requests from this server.
+ */
+const MAX_CLIENT_SPANS = 50;
+
+/** The trace payload for a request the page propagated, or null if it did not. */
+function clientSpan(r: Record<string, unknown>): Record<string, unknown> | null {
+  const traceId = typeof r.traceId === "string" ? r.traceId : null;
+  const spanId = typeof r.spanId === "string" ? r.spanId : null;
+  if (!traceId || !spanId || !/^[0-9a-f]{32}$/.test(traceId) || !/^[0-9a-f]{16}$/.test(spanId)) return null;
+  const start = new Date(String(r.timestamp ?? ""));
+  if (Number.isNaN(start.getTime())) return null;
+  const durationMs = Math.max(0, Number(r.responseTime) || 0);
+  const status = Number(r.statusCode) || 0;
+  const name = `${String(r.method ?? "GET")} ${String(r.path ?? "/")}`.slice(0, 200);
+  const statusCode = status === 0 || status >= 500 ? "ERROR" : "OK";
+  return {
+    traceId,
+    name,
+    startTime: start.toISOString(),
+    endTime: new Date(start.getTime() + durationMs).toISOString(),
+    durationMs,
+    statusCode,
+    spans: [
+      {
+        id: spanId,
+        name,
+        kind: "CLIENT",
+        startTime: start.toISOString(),
+        durationMs,
+        statusCode,
+        attributes: { "sentrinel.source": "browser", "http.method": r.method, "http.route": r.path, "http.status_code": status },
+      },
+    ],
+  };
+}
+
+/**
  * Separate, larger ceiling for session-replay chunks.
  *
  * A record batch that reaches half a megabyte is a runaway loop, so the small
@@ -104,6 +149,7 @@ export function createSentrinelTunnel(
     env,
     apiKey,
     release,
+    module,
     maxBodyBytes = DEFAULT_MAX_BODY,
     maxReplayBytes = DEFAULT_MAX_REPLAY_BODY,
     consumerIdentifier,
@@ -191,6 +237,7 @@ export function createSentrinelTunnel(
     if (batch.replay) {
       await forward("/api/ingest/replay", {
         appName,
+        module,
         env,
         ...batch.replay,
         release: effectiveRelease,
@@ -199,9 +246,9 @@ export function createSentrinelTunnel(
     }
 
     const sends: Promise<void>[] = [];
-    if (errors.length) sends.push(forward("/api/ingest/errors", { appName, env, errors }));
+    if (errors.length) sends.push(forward("/api/ingest/errors", { appName, module, env, errors }));
     if (requests.length) {
-      sends.push(forward("/api/ingest/requests", { appName, env, requests }));
+      sends.push(forward("/api/ingest/requests", { appName, module, env, requests }));
       // The same requests, aggregated. Both are needed and they are not
       // interchangeable: the rows above are the log view, and this is every
       // headline number on the Apps and Overview pages. Derived here rather
@@ -210,18 +257,28 @@ export function createSentrinelTunnel(
       sends.push(
         forward("/api/ingest/metrics", {
           appName,
+          module,
           env,
           timestamp: new Date().toISOString(),
           endpoints: rollUpEndpoints(requests as unknown as RollupRequest[]),
           consumers: rollUpConsumers(requests as unknown as RollupRequest[]),
         }),
       );
+      // A call the page sent a traceparent on is where a trace starts: the
+      // backend's span continues it by parent id. Forwarded as a client span so
+      // the click itself is on the waterfall — without it the trace begins at
+      // the server and the browser's part of the journey is invisible.
+      for (const r of requests.slice(0, MAX_CLIENT_SPANS)) {
+        const span = clientSpan(r);
+        if (span) sends.push(forward("/api/ingest/traces", { appName, module, env, ...span }));
+      }
     }
-    if (sessions.length) sends.push(forward("/api/ingest/sessions", { appName, env, sessions }));
+    if (sessions.length) sends.push(forward("/api/ingest/sessions", { appName, module, env, sessions }));
     if (events.length) {
       sends.push(
         forward("/api/ingest/events", {
           appName,
+          module,
           env,
           release: effectiveRelease,
           anonymousId: batch.anonymousId,

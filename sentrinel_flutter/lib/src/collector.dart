@@ -12,6 +12,7 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import 'metrics.dart';
 import 'models.dart';
 
 /// What the collector will not exceed while offline.
@@ -35,6 +36,7 @@ class SentrinelCollector {
     required this.appName,
     required this.env,
     required this.apiKey,
+    this.module,
     this.flushInterval = const Duration(seconds: 30),
     http.Client? client,
   }) : _client = client ?? http.Client();
@@ -43,6 +45,10 @@ class SentrinelCollector {
   final String appName;
   final String env;
   final String? apiKey;
+
+  /// Which part of the project this client is — `mobile`, `tablet`, `kiosk`.
+  /// Unset, the server names it after the API key.
+  final String? module;
   final Duration flushInterval;
   final http.Client _client;
 
@@ -149,8 +155,14 @@ class SentrinelCollector {
       _sessions.length +
       _replayed.values.fold(0, (n, list) => n + list.length);
 
+  /// Custom metrics fold here and drain on flush — one row per series, not one
+  /// per call, which is what makes count() safe in a build method.
+  final MetricRegistry metrics = MetricRegistry();
+
   Future<void> flush() async {
-    if (pending == 0) return;
+    // Metrics can be the only thing buffered: a screen that counts an event
+    // without making a request still has something to send.
+    if (pending == 0 && metrics.size == 0) return;
 
     // Taken before any await so records arriving mid-flush are not lost.
     final requests = List<RequestRecord>.from(_requests);
@@ -185,6 +197,7 @@ class SentrinelCollector {
     if (allRequests.isNotEmpty) {
       sends.add(_post('/api/ingest/${endpoints['request']}', {
         'appName': appName,
+        if (module != null) 'module': module,
         'env': env,
         'requests': allRequests,
       }));
@@ -192,6 +205,7 @@ class SentrinelCollector {
     if (allErrors.isNotEmpty) {
       sends.add(_post('/api/ingest/${endpoints['error']}', {
         'appName': appName,
+        if (module != null) 'module': module,
         'env': env,
         'errors': allErrors,
       }));
@@ -199,6 +213,7 @@ class SentrinelCollector {
     if (allLogs.isNotEmpty) {
       sends.add(_post('/api/ingest/${endpoints['log']}', {
         'appName': appName,
+        if (module != null) 'module': module,
         'env': env,
         'logs': allLogs,
       }));
@@ -209,6 +224,7 @@ class SentrinelCollector {
     for (final span in spans) {
       sends.add(_post('/api/ingest/traces', {
         'appName': appName,
+        if (module != null) 'module': module,
         'env': env,
         'traceId': span.traceId,
         'name': span.name,
@@ -223,12 +239,26 @@ class SentrinelCollector {
       }));
     }
 
+    // Custom metrics ride the same flush. Drained here rather than buffered per
+    // call because the registry folds increments in memory.
+    final points = metrics.drain(DateTime.now());
+    if (points.isNotEmpty) {
+      sends.add(_post('/api/ingest/custom-metrics', {
+        'appName': appName,
+        if (module != null) 'module': module,
+        'env': env,
+        if (release != null) 'version': release,
+        'metrics': points,
+      }));
+    }
+
     // Product events. The identity travels on the envelope rather than on each
     // row: every event in one flush came from the same install and the same
     // signed-in user, and repeating it per row would be pure payload.
     if (events.isNotEmpty && (anonymousId != null || userId != null)) {
       sends.add(_post('/api/ingest/events', {
         'appName': appName,
+        if (module != null) 'module': module,
         'env': env,
         if (anonymousId != null) 'anonymousId': anonymousId,
         if (userId != null) 'userId': userId,
@@ -245,6 +275,7 @@ class SentrinelCollector {
     if (allSessions.isNotEmpty) {
       sends.add(_post('/api/ingest/sessions', {
         'appName': appName,
+        if (module != null) 'module': module,
         'env': env,
         'sessions': allSessions,
       }));
@@ -261,6 +292,7 @@ class SentrinelCollector {
     if (allRequests.isNotEmpty) {
       sends.add(_post('/api/ingest/metrics', {
         'appName': appName,
+        if (module != null) 'module': module,
         'env': env,
         'timestamp': DateTime.now().toUtc().toIso8601String(),
         'endpoints': _rollUpEndpoints(allRequests),
@@ -385,7 +417,7 @@ class SentrinelCollector {
     _warned = true;
     final hint = switch (status) {
       401 || 403 =>
-        'Check apiKey, appName and env — the key must belong to this app and environment.',
+        'Check apiKey and env — the key must be issued for this environment.',
       429 => 'Over quota.',
       _ => body.isEmpty ? '' : body,
     };
