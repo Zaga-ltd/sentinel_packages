@@ -1,3 +1,4 @@
+# Shared with sentrinel_django: edit it there, then run scripts/sync-python-core.py.
 """Configuration: one dict of upper-case keys, with the environment behind it.
 
 Each framework package builds that dict its own way — Django reads a

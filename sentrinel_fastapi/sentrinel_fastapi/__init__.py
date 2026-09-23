@@ -1,33 +1,34 @@
-"""Sentrinel for Django.
+"""Sentrinel for FastAPI — and Starlette, and any ASGI app built on them.
 
-Two lines of settings and every request, error and log line reaches Sentrinel::
+One middleware and every request, error and log line reaches Sentrinel::
 
-    MIDDLEWARE = ["sentrinel_django.SentrinelMiddleware", ...]
+    from fastapi import FastAPI
+    from sentrinel_fastapi import SentrinelMiddleware
 
-    SENTRINEL = {
-        "SERVER_URL": "https://api.sentrinel.dev",
-        "APP_NAME": "orders",
-        "ENV": "prod",
-        "API_KEY": os.environ["SENTRINEL_API_KEY"],
-    }
+    app = FastAPI()
+    app.add_middleware(
+        SentrinelMiddleware,
+        server_url="https://api.sentrinel.dev",
+        app_name="orders",
+        env="prod",
+        api_key=os.environ["SENTRINEL_API_KEY"],
+    )
 
-Everything else — bodies, sampling, masking, custom metrics — is optional and
-documented at https://docs.sentrinel.dev/reference/django/
+Everything else — bodies, sampling, masking, spans, custom metrics — is
+optional and documented at https://docs.sentrinel.dev/reference/fastapi/
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from .collector import set_config_loader
 from .config import Config, load
 from .context import add_context, set_consumer
 from .logs import SentrinelLogHandler
 from .metrics import count, gauge, histogram, registry
 from .middleware import SentrinelMiddleware
 from .outbound import SentrinelSession, async_httpx_transport, httpx_transport, trace_headers
-from .settings import from_django_settings
-from .trace import parse_traceparent, traceparent_for
+from .trace import traceparent_for
 from .tracing import current_span_id, span, traced
 from .tunnel import sentrinel_tunnel
 
@@ -59,13 +60,6 @@ __all__ = [
 
 __version__ = "0.1.0"
 
-default_app_config = "sentrinel_django.apps.SentrinelConfig"
-
-# A collector created before the middleware — by a log line at startup, by the
-# tunnel — reads the SENTRINEL block from settings rather than the environment
-# alone.
-set_config_loader(from_django_settings)
-
 
 def capture_exception(
     exc: BaseException,
@@ -75,18 +69,20 @@ def capture_exception(
 ) -> None:
     """Report an exception you handled.
 
-    An exception you caught and dealt with never reaches the middleware, and
-    "dealt with" often means a degraded path the user still noticed. This puts
-    it in front of you::
+    An exception you caught never reaches the middleware, and neither does one
+    an exception handler turned into a response — FastAPI does that before the
+    middleware sees anything. Call this from either place::
 
-        try:
-            charge(order)
-        except PaymentError as exc:
-            capture_exception(exc, attributes={"order_id": order.id})
-            return fallback()
+        @app.exception_handler(PaymentError)
+        async def payment_failed(request, exc):
+            capture_exception(exc, request=request, attributes={"order_id": exc.order_id})
+            return JSONResponse({"detail": "payment failed"}, status_code=402)
+
+    The response that follows is then not counted as a second error.
     """
     from . import context
     from .collector import get_collector
+    from .errors import exception_row
 
     collector = get_collector()
     if not collector.config.configured or not collector.config.capture_errors:
@@ -95,19 +91,15 @@ def capture_exception(
     state = context.current() or {}
     merged = dict(state.get("attributes") or {})
     merged.update(attributes or {})
-    # A handled error the view then answers with a 500 is one error, not two:
-    # the middleware would otherwise add a row for the response as well.
     if state:
         state["error_recorded"] = True
 
     try:
-        from .errors import exception_row
-
         collector.record_error(
             exception_row(
                 exc,
-                method=getattr(request, "method", "GET") if request is not None else "GET",
-                route=_route_of(request),
+                method=_method_of(request, state),
+                route=_route_of(request, state),
                 status=500,
                 status_message="Handled",
                 state={**state, "attributes": merged},
@@ -117,15 +109,23 @@ def capture_exception(
         collector._debug("capture_exception failed", err)
 
 
-def _route_of(request: Any) -> str:
-    """The endpoint an error belongs to — the route, matching the request rows."""
-    if request is None:
-        return "/"
-    from .routes import route_for
+def _method_of(request: Any, state: dict[str, Any]) -> str:
+    if request is not None:
+        return getattr(request, "method", "GET") or "GET"
+    scope = state.get("scope") or {}
+    return scope.get("method", "GET")
 
-    path = getattr(request, "path", "") or "/"
+
+def _route_of(request: Any, state: dict[str, Any]) -> str:
+    """The endpoint an error belongs to — the route, matching the request rows."""
+    from .routes import route_for, template_path
+
+    scope = getattr(request, "scope", None) or state.get("scope")
+    path = state.get("path") or (scope or {}).get("path") or "/"
+    if not scope:
+        return template_path(path)
     try:
-        return route_for(request, path)
+        return route_for(scope, path, state.get("entry_root_path") or "")
     except Exception:
         return path
 
@@ -134,8 +134,8 @@ def current_trace() -> dict[str, str | None]:
     """The trace this request belongs to, or empty outside one.
 
     ``{"trace_id": …, "span_id": …, "parent_span_id": …}``. Useful for putting
-    the trace id in an error page or a support ticket, so a user's complaint
-    leads straight to the timeline.
+    the trace id in an error response or a support ticket, so a user's
+    complaint leads straight to the timeline.
     """
     from . import context
 
@@ -150,13 +150,12 @@ def current_trace() -> dict[str, str | None]:
 def outgoing_headers(headers: dict[str, str] | None = None) -> dict[str, str]:
     """Add this request's trace context to headers you are about to send.
 
-    The chain only continues if each service passes it on. A Django service
-    that reads `traceparent` and does not forward it joins the mobile app's
-    trace and then ends it, which looks like the downstream service never ran::
+    The chain only continues if each service passes it on::
 
-        requests.post(url, json=payload, headers=outgoing_headers())
+        await client.post(url, json=payload, headers=outgoing_headers())
 
-    Outside a request this returns the headers unchanged — there is no trace to
+    ``httpx_transport()`` does this for every call a client makes. Outside a
+    request this returns the headers unchanged — there is no trace to
     propagate, and inventing one would create a root that belongs to nobody.
     """
     from . import context
@@ -172,9 +171,8 @@ def outgoing_headers(headers: dict[str, str] | None = None) -> dict[str, str]:
 def flush() -> None:
     """Send everything buffered now.
 
-    The background thread does this on a timer; call it directly at the end of
-    a management command or a Celery task, where the process may exit before
-    the next tick.
+    The background thread does this on a timer; call it at the end of a script
+    or a worker job, where the process may exit before the next tick.
     """
     from .collector import get_collector
 

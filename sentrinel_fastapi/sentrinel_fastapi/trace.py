@@ -1,3 +1,4 @@
+# Shared with sentrinel_django: edit it there, then run scripts/sync-python-core.py.
 """W3C trace context, so a request that started elsewhere stays one trace.
 
 The Flutter and browser SDKs put a `traceparent` header on every call they

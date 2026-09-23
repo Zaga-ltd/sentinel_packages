@@ -26,13 +26,32 @@
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 BASE_URL="${SENTRINEL_INSTALL_BASE:-https://sentrinel.dev}"
 INSTALL_DIR="${SENTRINEL_HOME:-$HOME/.sentrinel}"
 BIN_DIR="${SENTRINEL_BIN_DIR:-$HOME/.local/bin}"
-ENV_FILE="$INSTALL_DIR/env"
 API_URL="${SENTRINEL_API_URL:-https://api.sentrinel.dev}"
 API_KEY="${SENTRINEL_API_KEY:-}"
+
+# ─── Profiles: one per app ───────────────────────────────────────────────────
+#
+# A key is pinned to one app, so watching a second app means a second key — and
+# without profiles the second install would overwrite the first. A profile is
+# just a name: it picks the env file the launcher reads, and the name the MCP
+# server is registered under.
+#
+#   curl … | SENTRINEL_API_KEY=snt_mcp_… SENTRINEL_PROFILE=merchant bash
+#
+# gives you `sentrinel-merchant` in Claude alongside plain `sentrinel`, and
+# `SENTRINEL_PROFILE=merchant sentrinel issues` on the command line. The key
+# still lives in a 0600 file rather than in any agent's config — only the
+# profile name goes there.
+PROFILE="${SENTRINEL_PROFILE:-}"
+case "$PROFILE" in
+  *[!A-Za-z0-9_-]*) fail "SENTRINEL_PROFILE must be letters, digits, dash or underscore." ;;
+esac
+ENV_FILE="$INSTALL_DIR/env${PROFILE:+.$PROFILE}"
+MCP_NAME="sentrinel${PROFILE:+-$PROFILE}"
 
 say()  { printf '  %s\n' "$*"; }
 fail() { printf '\n  %s\n\n' "$*" >&2; exit 1; }
@@ -97,11 +116,15 @@ fetch sentrinel-cli.js
 launcher() {
   cat > "$BIN_DIR/$1" <<LAUNCH
 #!/usr/bin/env bash
-if [ -f "$ENV_FILE" ]; then
+# The profile picks which key file to read, so one binary serves every app.
+# A variable already in the environment always wins, which keeps a one-off
+# \`SENTRINEL_API_KEY=… sentrinel issues\` working.
+_env="$INSTALL_DIR/env\${SENTRINEL_PROFILE:+.\$SENTRINEL_PROFILE}"
+if [ -f "\$_env" ]; then
   while IFS='=' read -r k v; do
     case "\$k" in ''|'#'*) continue ;; esac
     [ -n "\${!k:-}" ] || export "\$k=\$v"
-  done < "$ENV_FILE"
+  done < "\$_env"
 fi
 exec "$BUN_BIN" run "$INSTALL_DIR/$2" "\$@"
 LAUNCH
@@ -144,13 +167,18 @@ esac
 # the key stays out of the MCP config and out of `ps`.
 REGISTERED=""
 if [ -n "$API_KEY" ] && command -v claude >/dev/null 2>&1; then
-  claude mcp remove sentrinel --scope user >/dev/null 2>&1 || true
-  if claude mcp add sentrinel --scope user -- "$BIN_DIR/sentrinel-mcp" >/dev/null 2>&1; then
+  claude mcp remove "$MCP_NAME" --scope user >/dev/null 2>&1 || true
+  if [ -n "$PROFILE" ]; then
+    ADD_ENV=(--env "SENTRINEL_PROFILE=$PROFILE")
+  else
+    ADD_ENV=()
+  fi
+  if claude mcp add "$MCP_NAME" --scope user "${ADD_ENV[@]}" -- "$BIN_DIR/sentrinel-mcp" >/dev/null 2>&1; then
     REGISTERED=yes
-    say "Registered with Claude Code (user scope)."
+    say "Registered with Claude Code as \"$MCP_NAME\" (user scope)."
   else
     say "Could not register with Claude Code — add it yourself:"
-    say "  claude mcp add sentrinel -- $BIN_DIR/sentrinel-mcp"
+    say "  claude mcp add $MCP_NAME ${PROFILE:+--env SENTRINEL_PROFILE=$PROFILE }-- $BIN_DIR/sentrinel-mcp"
   fi
 fi
 
@@ -175,6 +203,11 @@ if [ -n "$REGISTERED" ]; then
   Done. In a Claude Code session:
 
     Look at Sentrinel's top unresolved issue, find the cause in this repo, and fix it.
+
+  Watching a second app? A key is pinned to one app, so give it a profile:
+
+    curl -fsSL $BASE_URL/install-mcp.sh | \\
+      SENTRINEL_API_KEY=<that app's key> SENTRINEL_PROFILE=<app-name> bash
 
   Using another agent? The skill goes wherever it reads from:
 

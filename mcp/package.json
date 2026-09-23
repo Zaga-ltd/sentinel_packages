@@ -1,7 +1,7 @@
 {
   "name": "@sentrinel/mcp",
-  "version": "0.1.0",
-  "description": "Sentrinel for coding agents — an MCP server and a CLI that hand Claude Code, Codex and friends your issues, logs and traces.",
+  "version": "0.2.0",
+  "description": "Sentrinel for coding agents \u2014 an MCP server and a CLI that hand Claude Code, Codex and friends your issues, logs and traces.",
   "type": "module",
   "bin": {
     "sentrinel-mcp": "./src/server.ts",

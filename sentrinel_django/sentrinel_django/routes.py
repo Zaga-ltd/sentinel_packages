@@ -5,9 +5,9 @@ path instead produces one endpoint row per id — an unbounded table and an
 "active endpoints" count in the thousands for an app with thirty routes.
 
 Django already knows the answer, so ask it first: ``resolver_match.route`` is
-the pattern that matched (``orders/<int:pk>/``). The heuristic below is only
-for what the resolver cannot name — a path that 404'd before matching anything,
-or a very old Django.
+the pattern that matched (``orders/<int:pk>/``). The shared id heuristic in
+``route_template`` is only for what the resolver cannot name — a path that
+404'd before matching anything, or a very old Django.
 """
 
 from __future__ import annotations
@@ -15,32 +15,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
-_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
-_NUMERIC = re.compile(r"^\d+$")
-_LONG_HEX = re.compile(r"^[0-9a-f]{12,}$", re.I)
+from .route_template import template_path
 
-#: A segment is an id when it is long enough *and* contains a digit.
-#
-# The digit is the whole trick. English route words — "facade", "settings",
-# "profile" — are long enough to trip a length check and contain no digits, so
-# a length rule alone turns them into wildcards and merges unrelated endpoints.
-_ID_MIN_LEN = 8
-
-
-def _looks_like_id(segment: str) -> bool:
-    if _NUMERIC.match(segment) or _UUID.match(segment) or _LONG_HEX.match(segment):
-        return True
-    if len(segment) >= _ID_MIN_LEN and any(c.isdigit() for c in segment):
-        return True
-    return False
-
-
-def template_path(path: str) -> str:
-    """Collapse id-shaped segments to ``:id``."""
-    if not path:
-        return path
-    parts = path.split("/")
-    return "/".join(":id" if _looks_like_id(p) else p for p in parts)
+__all__ = ["normalise_django_route", "route_for", "template_path"]
 
 
 def normalise_django_route(route: str) -> str:

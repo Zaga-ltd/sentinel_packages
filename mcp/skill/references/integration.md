@@ -77,7 +77,7 @@ tunnel exists to avoid.
 
 ## Django
 
-No runtime dependencies; Django 3.1–5.2 on Python 3.8+.
+No runtime dependencies; Django 3.1–6.1 on Python 3.9+.
 
 ```bash
 pip install "git+https://github.com/Zaga-ltd/sentinel_packages.git#subdirectory=sentrinel_django"
@@ -103,6 +103,45 @@ Logs arrive correlated with their request by adding
 `sentrinel_django.SentrinelLogHandler` to `LOGGING`.
 
 → <https://docs.sentrinel.dev/reference/django/>
+
+## FastAPI and Starlette
+
+No runtime dependencies; FastAPI 0.100+ (Starlette 0.27+) on Python 3.9+. A
+pure ASGI middleware, so any Starlette-based app works the same way.
+
+```bash
+pip install "git+https://github.com/Zaga-ltd/sentinel_packages.git#subdirectory=sentrinel_fastapi"
+```
+
+```python
+from sentrinel_fastapi import SentrinelMiddleware
+
+app.add_middleware(
+    SentrinelMiddleware,
+    server_url="https://api.sentrinel.dev",
+    app_name="orders",
+    module="api",
+    env="prod",
+    api_key=os.environ["SENTRINEL_API_KEY"],
+)
+```
+
+**Added last**, deliberately: Starlette runs the middleware added last first,
+and it measures from where it sits. Options are the Django settings in lower
+case (`sample_rate`, `exclude_paths`, `consumer_identifier`), every one also
+read from `SENTRINEL_*` environment variables; a misspelt option is a
+`TypeError` at startup. `consumer_identifier="x-tenant-id"` names the caller by
+a header.
+
+An `HTTPException` or a validation failure becomes a response inside FastAPI,
+so the middleware records it from the response (status, `detail` as the
+message); an exception handler that wants the stack trace calls
+`capture_exception(exc, request=request)`. Outgoing httpx calls are traced with
+`httpx.AsyncClient(transport=async_httpx_transport())`. Logs arrive correlated
+with `logging.getLogger().addHandler(SentrinelLogHandler())`, from sync and
+async endpoints alike.
+
+→ <https://docs.sentrinel.dev/reference/fastapi/>
 
 ## Flutter and Dart
 

@@ -1,3 +1,4 @@
+# Shared with sentrinel_django: edit it there, then run scripts/sync-python-core.py.
 """Spans: why a request was slow, not just that it was.
 
 A request row says a page took 900 ms. A trace says 740 of those were one
@@ -57,7 +58,7 @@ def span(
     """Time a block of work and file it under this request's trace.
 
     ```python
-    from sentrinel_django import span
+    from sentrinel_fastapi import span
 
     with span("charge.card", {"gateway": "stripe"}) as s:
         result = gateway.charge(order)

@@ -8,7 +8,6 @@ middleware, or inside a template.
 
 from __future__ import annotations
 
-import traceback
 from typing import Any
 
 from django.apps import AppConfig
@@ -48,23 +47,19 @@ def _on_exception(sender: Any, request: Any = None, **kwargs: Any) -> None:
     state["error_recorded"] = True
 
     try:
+        from .errors import exception_row
+        from .middleware import status_for_exception
+
         collector.record_error(
-            {
-                "method": getattr(request, "method", "GET") if request else "GET",
+            exception_row(
+                exc,
+                method=getattr(request, "method", "GET") if request else "GET",
                 # The route, so this error attaches to the endpoint the request
                 # rows already registered rather than creating a twin.
-                "path": _route_of(request),
-                "statusCode": 500,
-                "statusMessage": "Internal Server Error",
-                "errorType": exc_type.__name__ if exc_type else "Error",
-                "errorMessage": str(exc)[:2000],
-                "stackTrace": "".join(traceback.format_exception(exc_type, exc, tb))[:20_000],
-                "consumerIdentifier": state.get("consumer"),
-                "timestamp": _now_iso(),
-                "requestLogId": state.get("request_id"),
-                "traceId": state.get("trace_id"),
-                "attributes": state.get("attributes") or None,
-            }
+                route=_route_of(request),
+                status=status_for_exception(exc),
+                state=state,
+            )
         )
     except Exception as err:
         collector._debug("signal error capture failed", err)
@@ -81,8 +76,3 @@ def _route_of(request: Any) -> str:
     except Exception:
         return path
 
-
-def _now_iso() -> str:
-    from datetime import datetime, timezone
-
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

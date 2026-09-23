@@ -694,3 +694,171 @@ class TestOutbound:
         # The query string carried a secret and is not in the name or the url.
         assert "secret" not in json.dumps(sent.posts)
         assert span["attributes"]["http.status_code"] == 200
+
+
+class TestErrorParity:
+    """Errors counted the way the Node and FastAPI SDKs count them.
+
+    A raised Http404 used to be filed as a 500, and a 4xx a view *returned*
+    produced no error at all — so the Errors page showed server errors only,
+    some of which were missing records.
+    """
+
+    def test_a_raised_404_is_a_404_not_a_server_error(self, build, sent):
+        from django.http import Http404
+
+        mw = build()
+        mw.process_exception(rf.get("/orders/9/"), Http404("no such order"))
+        mw.collector.flush()
+        err = sent.rows("/api/ingest/errors", "errors")[0]
+        assert err["statusCode"] == 404 and err["errorType"] == "Http404"
+        assert err["statusMessage"] == "Not Found"
+
+    def test_permission_denied_is_a_403(self, build, sent):
+        from django.core.exceptions import PermissionDenied
+
+        mw = build()
+        mw.process_exception(rf.get("/ok/"), PermissionDenied("staff only"))
+        mw.collector.flush()
+        assert sent.rows("/api/ingest/errors", "errors")[0]["statusCode"] == 403
+
+    def test_a_returned_4xx_is_an_error_with_its_message(self, build, sent):
+        from django.http import JsonResponse
+
+        # The shape Django REST framework answers with, without raising.
+        mw = build(lambda r: JsonResponse({"detail": "Authentication credentials were not provided."}, status=401))
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+        err = sent.rows("/api/ingest/errors", "errors")[0]
+        assert err["statusCode"] == 401
+        assert err["errorMessage"] == "Authentication credentials were not provided."
+        # No resolver match in a RequestFactory request: the id heuristic names it.
+        assert err["path"] == "/ok/"
+        assert err["requestLogId"] == sent.rows("/api/ingest/requests", "requests")[0]["id"]
+
+    def test_field_errors_become_one_readable_line(self, build, sent):
+        from django.http import JsonResponse
+
+        body = {"detail": [{"loc": ["body", "email"], "msg": "field required"}]}
+        mw = build(lambda r: JsonResponse(body, status=422))
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+        assert sent.rows("/api/ingest/errors", "errors")[0]["errorMessage"] == "body.email: field required"
+
+    def test_a_success_is_not_an_error(self, build, sent):
+        mw = build()
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+        assert sent.payload("/api/ingest/errors") is None
+
+    def test_an_exception_django_recorded_is_not_counted_again_for_its_500(self, build, sent):
+        from django.http import HttpResponse
+
+        holder = {}
+
+        def view(request):
+            try:
+                raise ValueError("x")
+            except ValueError as exc:
+                holder["mw"].process_exception(request, exc)
+                return HttpResponse(status=500)
+
+        mw = build(view)
+        holder["mw"] = mw
+        mw(rf.get("/boom/"))
+        mw.collector.flush()
+        errors = sent.rows("/api/ingest/errors", "errors")
+        assert len(errors) == 1 and errors[0]["errorType"] == "ValueError"
+
+    def test_a_handled_error_answered_with_a_500_is_one_error(self, build, sent):
+        from django.http import HttpResponse
+
+        from sentrinel_django import capture_exception
+
+        def view(request):
+            try:
+                raise TimeoutError("gateway slow")
+            except TimeoutError as exc:
+                capture_exception(exc, request=request)
+                return HttpResponse("try later", status=503)
+
+        mw = build(view)
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+        errors = sent.rows("/api/ingest/errors", "errors")
+        assert len(errors) == 1 and errors[0]["errorType"] == "TimeoutError"
+
+    def test_errors_can_be_turned_off(self, build, sent):
+        from django.http import HttpResponse
+
+        mw = build(lambda r: HttpResponse(status=404), CAPTURE_ERRORS=False)
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+        assert sent.payload("/api/ingest/errors") is None
+
+
+class TestTunnelIsNotTraffic:
+    def test_the_tunnel_is_not_recorded_as_a_request_of_this_app(self, build, sent):
+        from sentrinel_django import sentrinel_tunnel
+
+        mw = build(sentrinel_tunnel)
+        mw(rf.post("/api/_sentrinel", data=json.dumps({"errors": [{"m": 1}]}), content_type="application/json"))
+        sent.posts.clear()
+        mw.collector.flush()
+        assert sent.payload("/api/ingest/requests") is None
+        assert sent.payload("/api/ingest/metrics") is None
+
+
+class TestAsyncAndHttpx:
+    def test_traced_covers_an_async_functions_work(self):
+        import asyncio
+
+        from sentrinel_django import context, traced
+
+        @traced("pricing.quote")
+        async def quote():
+            await asyncio.sleep(0.02)
+            return 30
+
+        state = context.begin(trace_id="a" * 32, span_id="b" * 16)
+        try:
+            assert asyncio.run(quote()) == 30
+        finally:
+            context.end()
+        [recorded] = state["spans"]
+        assert recorded["name"] == "pricing.quote"
+        # The sync wrapper timed the creation of the coroutine: microseconds.
+        assert recorded["durationMs"] >= 15
+
+    def test_an_httpx_call_becomes_a_span_and_carries_the_trace(self, build, sent):
+        import httpx
+        from django.http import HttpResponse
+
+        from sentrinel_django import httpx_transport
+
+        received = {}
+
+        def remote(request):
+            received["traceparent"] = request.headers.get("traceparent")
+            return httpx.Response(200, json={})
+
+        def view(request):
+            with httpx.Client(transport=httpx_transport(httpx.MockTransport(remote))) as client:
+                client.get("https://rates.example.com/v1/usd?key=secret")
+            return HttpResponse("ok")
+
+        mw = build(view)
+        mw(rf.get("/ok/", HTTP_TRACEPARENT="00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"))
+        mw.collector.flush()
+        call = next(s for s in sent.payload("/api/ingest/traces")["spans"] if s["kind"] == "CLIENT")
+        assert call["name"] == "GET rates.example.com/v1/usd"
+        assert received["traceparent"] == f"00-4bf92f3577b34da6a3ce929d0e0e4736-{call['id']}-01"
+
+
+class TestCollectorAdoption:
+    def test_a_collector_made_before_settings_were_readable_adopts_real_ones(self):
+        collector_module.reset_collector()
+        early = collector_module.get_collector()
+        assert not early.config.configured
+        adopted = collector_module.get_collector(load({"SERVER_URL": "http://api.test", "APP_NAME": "orders"}))
+        assert adopted is early and early.config.app_name == "orders"

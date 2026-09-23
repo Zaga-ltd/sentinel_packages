@@ -12,16 +12,17 @@ into a 500 has made the service less reliable than it was without it.
 from __future__ import annotations
 
 import time
-import traceback
 from typing import Any, Callable
 
-from . import context
+from . import context, errors
 from .collector import get_collector
-from .config import Config, from_django_settings
+from .config import Config
+from .settings import from_django_settings
 from .masking import mask_body, mask_mapping
 from .routes import route_for
 from .sampling import should_capture
-from .trace import generate_span_id, generate_trace_id, parse_traceparent, traceparent_for
+from .trace import generate_span_id, generate_trace_id, parse_traceparent
+from .tracing import request_trace
 
 #: Header names Django exposes as META keys.
 _IP_HEADERS = ("HTTP_X_FORWARDED_FOR", "HTTP_X_REAL_IP", "REMOTE_ADDR")
@@ -74,6 +75,35 @@ def _default_consumer(request: Any) -> str | None:
     return str(ident) if ident is not None else None
 
 
+def status_for_exception(exc: BaseException) -> int:
+    """The status Django will answer with for an exception a view raised.
+
+    ``Http404`` is a 404 and ``PermissionDenied`` a 403 — Django turns them into
+    those responses itself. Recording every raise as a 500 filed each missing
+    record under server errors and inflated the one number that says the
+    service is broken.
+    """
+    try:
+        from django.core.exceptions import PermissionDenied, SuspiciousOperation
+        from django.http import Http404
+    except Exception:  # pragma: no cover - Django is present wherever this runs
+        return 500
+    if isinstance(exc, Http404):
+        return 404
+    if isinstance(exc, PermissionDenied):
+        return 403
+    if isinstance(exc, SuspiciousOperation):
+        return 400
+    try:
+        from django.core.exceptions import BadRequest  # Django 3.2+
+
+        if isinstance(exc, BadRequest):
+            return 400
+    except ImportError:
+        pass
+    return 500
+
+
 class SentrinelMiddleware:
     """Records every request, and every exception raised out of a view."""
 
@@ -114,7 +144,11 @@ class SentrinelMiddleware:
             raise
 
         try:
-            self._record(request, response, started, state, request_body)
+            # The tunnel's own requests are the browser's telemetry in transit,
+            # one per flush. Recording them filled the endpoint list with a
+            # route nobody wrote and a request row per page per ten seconds.
+            if not getattr(request, "_sentrinel_skip", False):
+                self._record(request, response, started, state, request_body)
         except Exception as exc:  # telemetry must not break the response
             self.collector._debug("record failed", exc)
         finally:
@@ -134,27 +168,13 @@ class SentrinelMiddleware:
                 return None
             state["error_recorded"] = True
             self.collector.record_error(
-                {
-                    "method": getattr(request, "method", "GET"),
-                    # The route, not the URL. Endpoints are registered by
-                    # whatever an error reports here, so sending the raw path
-                    # registers a second endpoint for the one the requests
-                    # already created — /boom/ beside /boom — and splits an
-                    # endpoint's error count away from its traffic.
-                    "path": route_for(request, _path(request)),
-                    "statusCode": 500,
-                    "statusMessage": "Internal Server Error",
-                    "errorType": type(exception).__name__,
-                    "errorMessage": str(exception)[:2000],
-                    "stackTrace": "".join(
-                        traceback.format_exception(type(exception), exception, exception.__traceback__)
-                    )[:20_000],
-                    "consumerIdentifier": state.get("consumer"),
-                    "timestamp": _now_iso(),
-                    "requestLogId": state.get("request_id"),
-                    "traceId": state.get("trace_id"),
-                    "attributes": state.get("attributes") or None,
-                }
+                errors.exception_row(
+                    exception,
+                    method=getattr(request, "method", "GET"),
+                    route=route_for(request, _path(request)),
+                    status=status_for_exception(exception),
+                    state=state,
+                )
             )
         except Exception as exc:
             self.collector._debug("error capture failed", exc)
@@ -213,6 +233,28 @@ class SentrinelMiddleware:
             method, route, status, elapsed_ms, request_size, response_size, consumer
         )
 
+        # A 4xx or 5xx that no exception explained — a validation failure, a
+        # permission check, a view that returned HttpResponseNotFound. The Node
+        # plugin records these too; without them the Errors page had server
+        # errors only and every client error was invisible.
+        if (
+            cfg.capture_errors
+            and status >= 400
+            and response is not None
+            and not state.get("error_recorded")
+        ):
+            state["error_recorded"] = True
+            self.collector.record_error(
+                errors.response_row(
+                    method=method,
+                    route=route,
+                    status=status,
+                    state={**state, "consumer": consumer},
+                    body=_body_peek(response),
+                    content_type=_header(response, "Content-Type"),
+                )
+            )
+
         if cfg.capture_logs:
             logs = state.get("logs") or []
             if logs:
@@ -270,69 +312,30 @@ class SentrinelMiddleware:
             row["traceId"] = state["trace_id"]
 
         self.collector.record_request(row)
-        self._record_trace(state, method, route, status, elapsed_ms, started)
-
-    def _record_trace(
-        self,
-        state: dict[str, Any],
-        method: str,
-        route: str,
-        status: int,
-        elapsed_ms: float,
-        started: float,
-    ) -> None:
-        """Ship the request's span tree, if it recorded any.
-
-        Only when there are child spans: a trace holding nothing but its own
-        server span repeats what the request row already says, and would double
-        the rows for every request in exchange for nothing.
-        """
-        spans = state.get("spans") or []
-        if not spans:
-            return
-
-        root_id = state.get("span_id")
-        start_iso = state.get("started_iso") or _now_iso()
-        end_iso = _now_iso()
-        root = {
-            "id": root_id,
-            "traceId": state.get("trace_id"),
-            # The caller's span when one sent a traceparent, so the phone's
-            # request and this server's work share a waterfall.
-            "parentId": state.get("parent_span_id"),
-            "name": f"{method} {route}",
-            "kind": "SERVER",
-            "startTime": start_iso,
-            "endTime": end_iso,
-            "durationMs": round(elapsed_ms, 3),
-            "statusCode": "ERROR" if status >= 500 else "OK",
-            "attributes": {
-                "http.method": method,
-                "http.route": route,
-                "http.status_code": status,
-                **(state.get("attributes") or {}),
-            },
-        }
-        dropped = state.get("spans_dropped")
-        if dropped:
-            root["attributes"]["sentrinel.spans_dropped"] = dropped
-
-        self.collector.record_trace(
-            {
-                "traceId": state.get("trace_id"),
-                "requestLogId": state.get("request_id"),
-                "name": f"{method} {route}",
-                "startTime": start_iso,
-                "endTime": end_iso,
-                "durationMs": round(elapsed_ms, 3),
-                "statusCode": status,
-                "spans": [root, *spans],
-            }
-        )
+        trace = request_trace(state, method, route, status, elapsed_ms)
+        if trace:
+            self.collector.record_trace(trace)
 
 
 def _path(request: Any) -> str:
     return getattr(request, "path", "") or "/"
+
+
+def _header(response: Any, name: str) -> str | None:
+    try:
+        return response.get(name)
+    except Exception:
+        return None
+
+
+def _body_peek(response: Any) -> bytes | None:
+    """The start of a response body, for its error message. Never a stream."""
+    if getattr(response, "streaming", False):
+        return None
+    try:
+        return bytes(response.content[: errors.BODY_PEEK_BYTES])
+    except Exception:
+        return None
 
 
 def _response_size(response: Any) -> int:

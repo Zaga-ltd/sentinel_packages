@@ -1,3 +1,4 @@
+# Shared with sentrinel_django: edit it there, then run scripts/sync-python-core.py.
 """Custom metrics: the numbers only your application knows.
 
 Tokens spent, revenue booked, queue depth, jobs retried. Tracing says why a

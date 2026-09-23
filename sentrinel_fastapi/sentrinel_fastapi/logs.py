@@ -1,3 +1,4 @@
+# Shared with sentrinel_django: edit it there, then run scripts/sync-python-core.py.
 """A logging handler, so the lines you already write reach Sentrinel.
 
 Attached to the logging configuration it captures records the application
@@ -50,7 +51,7 @@ class SentrinelLogHandler(logging.Handler):
     Add it wherever the project configures logging — a ``LOGGING`` dict::
 
         "handlers": {
-            "sentrinel": {"class": "sentrinel_django.SentrinelLogHandler", "level": "INFO"},
+            "sentrinel": {"class": "sentrinel_fastapi.SentrinelLogHandler", "level": "INFO"},
         },
 
     or directly::

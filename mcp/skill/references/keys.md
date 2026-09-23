@@ -11,7 +11,7 @@ for?***
 
 | Kind | Prefix | Can | Use it for |
 |---|---|---|---|
-| Server | `snt_live_`, `snt_dev_` | send application telemetry | a backend: Elysia, Express, Next.js, Bun, Django, a browser tunnel route |
+| Server | `snt_live_`, `snt_dev_` | send application telemetry | a backend: Elysia, Express, Next.js, Bun, Django, FastAPI, a browser tunnel route |
 | Mobile app | `snt_mobile_` | send what a phone sends | Flutter, iOS, Android — it ships inside a public bundle |
 | Database collector | `snt_db_` | send Postgres statistics | the collector on the database host |
 | OpenTelemetry | `snt_otlp_` | accept OTLP | an existing OTel exporter |

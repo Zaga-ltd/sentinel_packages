@@ -1,12 +1,13 @@
 # Sentrinel packages
 
-The public SDKs for [Sentrinel](https://sentrinel.dev). Four packages and the
+The public SDKs for [Sentrinel](https://sentrinel.dev). Five packages and the
 agent skill, one repo.
 
 | Package | For | Install |
 |---|---|---|
 | [`src/`](src) | Elysia, Express, Next.js, Bun, any JS backend | `bun add "@sentrinel/plugin@github:Zaga-ltd/sentinel_packages"` |
-| [`sentrinel_django/`](sentrinel_django) | Django 3.1 – 5.2 | `pip install "git+https://github.com/Zaga-ltd/sentinel_packages.git#subdirectory=sentrinel_django"` |
+| [`sentrinel_django/`](sentrinel_django) | Django 3.1 – 6.1 | `pip install "git+https://github.com/Zaga-ltd/sentinel_packages.git#subdirectory=sentrinel_django"` |
+| [`sentrinel_fastapi/`](sentrinel_fastapi) | FastAPI 0.100+, Starlette, any ASGI app | `pip install "git+https://github.com/Zaga-ltd/sentinel_packages.git#subdirectory=sentrinel_fastapi"` |
 | [`sentrinel_flutter_integration/`](sentrinel_flutter_integration) | Flutter apps | a `git:` dependency — see below |
 | [`mcp/`](mcp) | Claude Code, Codex and other agents | `curl -fsSL https://sentrinel.dev/install-mcp.sh \| bash` |
 | [`mcp/skill/`](mcp/skill) | the agent skill — how to use those tools well | `sentrinel skill install [--cursor\|--agents]` |

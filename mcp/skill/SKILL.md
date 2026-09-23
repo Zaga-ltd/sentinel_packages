@@ -1,6 +1,6 @@
 ---
 name: sentrinel
-description: Work with Sentrinel, an error and performance monitor — read production telemetry (issues, the exact requests behind them, traces, logs, Postgres query and wait statistics) to diagnose a real bug or slowdown, and add or configure Sentrinel in an app (Elysia, Express, Next.js, Bun, browser, Django, Flutter/Dart, native mobile, Postgres). Use whenever someone points at production ("what is erroring", "why is checkout slow", "fix the top issue", "did my fix work"), asks to install, wire up, configure or debug Sentrinel itself, or asks which API key a thing needs. Reads go through the Sentrinel MCP server or the `sentrinel` CLI.
+description: Work with Sentrinel, an error and performance monitor — read production telemetry (issues, the exact requests behind them, traces, logs, Postgres query and wait statistics) to diagnose a real bug or slowdown, and add or configure Sentrinel in an app (Elysia, Express, Next.js, Bun, browser, Django, FastAPI, Flutter/Dart, native mobile, Postgres). Use whenever someone points at production ("what is erroring", "why is checkout slow", "fix the top issue", "did my fix work"), asks to install, wire up, configure or debug Sentrinel itself, or asks which API key a thing needs. Reads go through the Sentrinel MCP server or the `sentrinel` CLI.
 ---
 
 # Sentrinel

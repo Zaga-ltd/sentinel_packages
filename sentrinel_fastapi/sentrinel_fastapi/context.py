@@ -1,3 +1,4 @@
+# Shared with sentrinel_django: edit it there, then run scripts/sync-python-core.py.
 """Per-request state, so a log line knows which request wrote it.
 
 ``contextvars`` rather than thread locals: it is correct under WSGI threads and
@@ -53,7 +54,7 @@ def add_context(**attributes: Any) -> None:
     This is what turns a request row into a canonical wide event: the tier, the
     customer, the feature flag that was on. Called from a request handler::
 
-        from sentrinel_django import add_context
+        from sentrinel_fastapi import add_context
         add_context(tier="enterprise", customer_id=org.id)
     """
     state = _current.get()

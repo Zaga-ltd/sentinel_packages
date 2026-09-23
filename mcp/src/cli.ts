@@ -24,6 +24,8 @@ import { dirname } from "node:path";
 import { homedir } from "node:os";
 
 import { configFromEnv, SentrinelClient } from "./client";
+import { VERSION } from "./version";
+import { applyUpdate, autoUpdate, fetchManifest, isNewer } from "./update";
 import { mergeBlock, planFromArgs } from "./skill";
 import {
   issuesToMarkdown,
@@ -50,6 +52,8 @@ const USAGE = `sentrinel — Sentrinel for coding agents
   sentrinel activity <db-id> [--period 3600]    wait events, blocking, longest running
   sentrinel dbhealth <db-id> [--period 3600]    connections, deadlocks, temp bytes
   sentrinel resolve|ignore|reopen <id>      needs an "AI agent — may resolve issues" key
+  sentrinel update                          fetch the latest server and CLI, keep settings
+  sentrinel version                         what is installed, and what is published
   --json                                    raw API response
 
   sentrinel skill                           print the agent skill (how to use all of this)
@@ -168,6 +172,21 @@ export async function run(argv: string[], client: SentrinelClient): Promise<stri
       const res = await client.setIssueStatus(id, status);
       return out(res, () => `Issue ${id} is now ${status}.`);
     }
+    case "update": {
+      const res = await applyUpdate();
+      if (!res.ok) throw new Error(res.message);
+      return res.message;
+    }
+    case "version": {
+      const manifest = await fetchManifest();
+      const latest = manifest?.version;
+      const suffix = !latest
+        ? "  (could not reach the update server)"
+        : isNewer(latest, VERSION)
+          ? `  — ${latest} is available, run \`sentrinel update\``
+          : "  (current)";
+      return `sentrinel ${VERSION}${suffix}`;
+    }
     case undefined:
     case "help":
     case "--help":
@@ -206,9 +225,23 @@ if (import.meta.main) {
       process.exit(0);
     }
 
+    // Upgrading and reporting a version must work without a key — needing
+    // credentials to upgrade is how an install stays old.
+    if (first === "update" || first === "version") {
+      const text = await run(process.argv.slice(2), null as unknown as SentrinelClient);
+      process.stdout.write(text + "\n");
+      process.exit(0);
+    }
+
     const client = new SentrinelClient(configFromEnv());
     const text = await run(process.argv.slice(2), client);
     process.stdout.write(text + "\n");
+
+    // After the answer, never before it: a check that delayed the output would
+    // be a tax on every command. The notice goes to stderr so piping the
+    // result into a prompt stays clean.
+    const note = await autoUpdate();
+    if (note) process.stderr.write(note + "\n");
   } catch (err) {
     console.error(`sentrinel: ${err instanceof Error ? err.message : err}`);
     process.exit(1);

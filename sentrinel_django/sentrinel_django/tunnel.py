@@ -1,36 +1,18 @@
-"""The endpoint the browser SDK posts to.
+"""The endpoint the browser SDK posts to, as a Django view.
 
-Everything in a JavaScript bundle is public, so the browser SDK holds **no API
-key**. It posts batches to your own server, and your server forwards them with
-the key. This is that endpoint, in one URL line.
-
-It also pins `appName`, `env` and `module` server-side, ignoring whatever the
-batch claims. Without that, anyone who found the URL could write telemetry into
-a different app in your account, or label it as a different part of this one.
-The part is `TUNNEL_MODULE` ("web" unless set), not this server's `MODULE`: the
-page and the server are two parts of one project, and a batch through here is
-always the page's.
+The forwarding itself — which paths, and pinning ``appName``, ``env`` and
+``module`` so a page cannot write anywhere else — is ``tunnel_core``, shared
+with the FastAPI SDK. This is only the Django request and response around it.
 """
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from .collector import get_collector
+from .tunnel_core import MAX_BODY_BYTES, ROUTES as _ROUTES, forward
 
-#: Batch keys the browser SDK sends, and the ingest path each belongs to.
-_ROUTES: tuple[tuple[str, str], ...] = (
-    ("errors", "/api/ingest/errors"),
-    ("requests", "/api/ingest/requests"),
-    ("logs", "/api/ingest/logs"),
-    ("sessions", "/api/ingest/sessions"),
-    ("events", "/api/ingest/events"),
-    ("replay", "/api/ingest/replay"),
-)
-
-#: A browser batch is small. Anything past this is not a browser.
-MAX_BODY_BYTES = 2_000_000
+__all__ = ["sentrinel_tunnel", "forward", "MAX_BODY_BYTES", "_ROUTES"]
 
 
 def sentrinel_tunnel(request: Any) -> Any:
@@ -51,45 +33,19 @@ def sentrinel_tunnel(request: Any) -> Any:
     to be embedded in the page for a request that carries no authority anyway.
     """
     from django.http import HttpResponse, JsonResponse
-    from django.views.decorators.csrf import csrf_exempt  # noqa: F401  (documented above)
 
+    # Not recorded as a request of this app — see the middleware.
+    request._sentrinel_skip = True
     if request.method != "POST":
         return HttpResponse(status=405)
-
-    collector = get_collector()
-    cfg = collector.config
-    if not cfg.configured:
-        # Accept and drop: a misconfigured server should not make the page
-        # retry forever, and the browser cannot fix this.
-        return JsonResponse({"ok": False, "reason": "not configured"}, status=202)
 
     try:
         raw = request.body
     except Exception:
         return HttpResponse(status=400)
-    if len(raw) > MAX_BODY_BYTES:
-        return JsonResponse({"error": "batch too large"}, status=413)
 
-    try:
-        batch = json.loads(raw or b"{}")
-    except ValueError:
-        return HttpResponse(status=400)
-    if not isinstance(batch, dict):
-        return HttpResponse(status=400)
-
-    forwarded = 0
-    for key, path in _ROUTES:
-        rows = batch.get(key)
-        if not rows:
-            continue
-        # appName and env come from settings, never from the batch.
-        head = {"appName": cfg.app_name, "env": cfg.env}
-        if cfg.tunnel_module:
-            head["module"] = cfg.tunnel_module
-        collector._post(path, {**head, key: rows})
-        forwarded += len(rows) if isinstance(rows, list) else 1
-
-    return JsonResponse({"ok": True, "forwarded": forwarded})
+    status, body = forward(get_collector(), raw)
+    return JsonResponse(body, status=status)
 
 
 # Applied here rather than as a decorator above so the function keeps a plain

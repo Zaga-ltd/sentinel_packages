@@ -1,3 +1,4 @@
+# Shared with sentrinel_django: edit it there, then run scripts/sync-python-core.py.
 """Buffering, rolling up, and shipping.
 
 Three properties this has to hold, because a monitoring library that breaks its
@@ -37,7 +38,7 @@ from .config import Config, load
 #: them.
 INSTANCE_ID = f"{os.uname().nodename if hasattr(os, 'uname') else 'host'}:{os.getpid()}"
 
-_USER_AGENT = "sentrinel-django/0.1.0"
+_USER_AGENT = "sentrinel-fastapi/0.1.0"
 
 
 def _percentile(sorted_values: list[float], q: float) -> float:

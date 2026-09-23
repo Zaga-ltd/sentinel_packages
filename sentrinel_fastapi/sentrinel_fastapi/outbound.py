@@ -1,3 +1,4 @@
+# Shared with sentrinel_django: edit it there, then run scripts/sync-python-core.py.
 """Instrumenting the calls your app makes.
 
 A slow page is often slow because of something it called. Without this the
@@ -37,7 +38,7 @@ class SentrinelSession:
     """A ``requests.Session`` that records every call as a span.
 
     ```python
-    from sentrinel_django import SentrinelSession
+    from sentrinel_fastapi import SentrinelSession
 
     http = SentrinelSession()
     http.get("https://api.example.com/rates")   # a span, and traceparent sent
@@ -116,7 +117,7 @@ def httpx_transport(transport: Any = None) -> Any:
 
     ```python
     import httpx
-    from sentrinel_django import httpx_transport
+    from sentrinel_fastapi import httpx_transport
 
     client = httpx.Client(transport=httpx_transport())
     ```
