@@ -78,11 +78,12 @@ def capture_exception(
             capture_exception(exc, request=request, attributes={"order_id": exc.order_id})
             return JSONResponse({"detail": "payment failed"}, status_code=402)
 
-    The response that follows is then not counted as a second error.
+    The error is recorded with the status of the response that follows —
+    the 402 above — and that response is not counted as a second error.
     """
     from . import context
     from .collector import get_collector
-    from .errors import exception_row
+    from .errors import defer_handled, exception_row
 
     collector = get_collector()
     if not collector.config.configured or not collector.config.capture_errors:
@@ -91,20 +92,24 @@ def capture_exception(
     state = context.current() or {}
     merged = dict(state.get("attributes") or {})
     merged.update(attributes or {})
-    if state:
-        state["error_recorded"] = True
 
     try:
-        collector.record_error(
-            exception_row(
-                exc,
-                method=_method_of(request, state),
-                route=_route_of(request, state),
-                status=500,
-                status_message="Handled",
-                state={**state, "attributes": merged},
-            )
+        row = exception_row(
+            exc,
+            method=_method_of(request, state),
+            route=_route_of(request, state),
+            status=500,
+            status_message="Handled",
+            state={**state, "attributes": merged},
         )
+        if state:
+            # Inside a request the response decides the status: the handler
+            # above answers 402, so the error is a 402. And the response is not
+            # recorded as a second error beside it.
+            state["error_recorded"] = True
+            defer_handled(state, row)
+        else:
+            collector.record_error(row)
     except Exception as err:
         collector._debug("capture_exception failed", err)
 

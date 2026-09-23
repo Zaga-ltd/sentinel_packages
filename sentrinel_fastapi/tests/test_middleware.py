@@ -345,6 +345,39 @@ class TestErrors:
         assert errors[0]["path"] == "/pay/:order_id"
         assert errors[0]["attributes"]["gateway"] == "stripe"
         assert "card declined" in errors[0]["stackTrace"]
+        # The status the caller got, not a guess made before the handler answered.
+        assert errors[0]["statusCode"] == 402
+        assert errors[0]["statusMessage"] == "Payment Required"
+
+    def test_a_handled_error_the_caller_never_saw_stays_a_500(self, build, sent):
+        from sentrinel_fastapi import capture_exception
+
+        app = FastAPI()
+
+        @app.get("/rates")
+        async def rates(request: Request):
+            try:
+                raise TimeoutError("rates API slow")
+            except TimeoutError as exc:
+                capture_exception(exc, request=request)
+                return {"rates": "cached"}
+
+        client, collector = build(app, consumer_identifier="x-tenant")
+        assert client.get("/rates", headers={"x-tenant": "acme"}).status_code == 200
+        collector.flush()
+        [err] = sent.rows("/api/ingest/errors", "errors")
+        assert (err["statusCode"], err["statusMessage"]) == (500, "Handled")
+        # Identity decided by the time the response completes reaches it too.
+        assert err["consumerIdentifier"] == "acme"
+
+    def test_a_handled_error_outside_a_request_is_sent_at_once(self, build, sent):
+        from sentrinel_fastapi import capture_exception
+
+        _, collector = build(make_app())
+        capture_exception(RuntimeError("nightly job failed"))
+        collector.flush()
+        [err] = sent.rows("/api/ingest/errors", "errors")
+        assert (err["statusCode"], err["errorType"]) == (500, "RuntimeError")
 
     def test_an_error_is_never_sampled_away(self, build, sent):
         client, collector = build(make_app(), sample_rate=0.0, raise_server_exceptions=False)

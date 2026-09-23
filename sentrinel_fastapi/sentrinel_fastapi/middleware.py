@@ -359,6 +359,11 @@ class SentrinelMiddleware:
             method, route, status, elapsed_ms, request_size, response_size, consumer
         )
 
+        # Errors the app reported with capture_exception, now that the status
+        # they were answered with is known.
+        for row in errors.settle_handled(state, status, consumer):
+            self.collector.record_error(row)
+
         if cfg.capture_errors and not state.get("error_recorded"):
             link_state = {**state, "consumer": consumer}
             if raised is not None:

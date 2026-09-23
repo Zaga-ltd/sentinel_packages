@@ -75,6 +75,37 @@ def exception_row(
     }
 
 
+def defer_handled(state: dict[str, Any], row: dict[str, Any]) -> None:
+    """Hold a handled exception's row until the response says what it was.
+
+    ``capture_exception`` runs before the response exists — inside an
+    exception handler, or an ``except`` in a view — so the status it could
+    record then is a guess. The middleware settles the row with the status the
+    caller actually received.
+    """
+    state.setdefault("handled", []).append(row)
+
+
+def settle_handled(
+    state: dict[str, Any], status: int, consumer: str | None = None
+) -> list[dict[str, Any]]:
+    """The rows ``defer_handled`` held, stamped with the response's status.
+
+    A handled error answered with a 4xx or 5xx is recorded as that status. One
+    the caller never saw — a fallback that still returned 200 — keeps the 500
+    and "Handled" it was captured with, since an error row with a success
+    status would read as no error at all.
+    """
+    rows = state.pop("handled", None) or []
+    for row in rows:
+        if status >= 400:
+            row["statusCode"] = status
+            row["statusMessage"] = reason_phrase(status)
+        if consumer and not row.get("consumerIdentifier"):
+            row["consumerIdentifier"] = consumer
+    return rows
+
+
 def message_from_body(body: bytes | None, content_type: str | None) -> str | None:
     """The message a JSON error body carries, if it carries one.
 

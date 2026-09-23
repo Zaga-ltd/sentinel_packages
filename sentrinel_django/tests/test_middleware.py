@@ -787,6 +787,27 @@ class TestErrorParity:
         mw.collector.flush()
         errors = sent.rows("/api/ingest/errors", "errors")
         assert len(errors) == 1 and errors[0]["errorType"] == "TimeoutError"
+        # Recorded as the 503 the caller got, not a 500 guessed before it.
+        assert errors[0]["statusCode"] == 503
+        assert errors[0]["statusMessage"] == "Service Unavailable"
+
+    def test_a_handled_error_the_caller_never_saw_stays_a_500(self, build, sent):
+        from django.http import HttpResponse
+
+        from sentrinel_django import capture_exception
+
+        def view(request):
+            try:
+                raise TimeoutError("rates API slow")
+            except TimeoutError as exc:
+                capture_exception(exc, request=request)
+                return HttpResponse("cached rates")
+
+        mw = build(view)
+        mw(rf.get("/ok/"))
+        mw.collector.flush()
+        [err] = sent.rows("/api/ingest/errors", "errors")
+        assert (err["statusCode"], err["statusMessage"]) == (500, "Handled")
 
     def test_errors_can_be_turned_off(self, build, sent):
         from django.http import HttpResponse

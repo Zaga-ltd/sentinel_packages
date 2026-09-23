@@ -233,6 +233,11 @@ class SentrinelMiddleware:
             method, route, status, elapsed_ms, request_size, response_size, consumer
         )
 
+        # Errors the view reported with capture_exception, now that the status
+        # they were answered with is known.
+        for row in errors.settle_handled(state, status, consumer):
+            self.collector.record_error(row)
+
         # A 4xx or 5xx that no exception explained — a validation failure, a
         # permission check, a view that returned HttpResponseNotFound. The Node
         # plugin records these too; without them the Errors page had server

@@ -95,24 +95,25 @@ def capture_exception(
     state = context.current() or {}
     merged = dict(state.get("attributes") or {})
     merged.update(attributes or {})
-    # A handled error the view then answers with a 500 is one error, not two:
-    # the middleware would otherwise add a row for the response as well.
-    if state:
-        state["error_recorded"] = True
-
     try:
-        from .errors import exception_row
+        from .errors import defer_handled, exception_row
 
-        collector.record_error(
-            exception_row(
-                exc,
-                method=getattr(request, "method", "GET") if request is not None else "GET",
-                route=_route_of(request),
-                status=500,
-                status_message="Handled",
-                state={**state, "attributes": merged},
-            )
+        row = exception_row(
+            exc,
+            method=getattr(request, "method", "GET") if request is not None else "GET",
+            route=_route_of(request),
+            status=500,
+            status_message="Handled",
+            state={**state, "attributes": merged},
         )
+        if state:
+            # Inside a request the response decides the status, and a handled
+            # error the view answers with a 503 is one error, not two: the
+            # middleware would otherwise add a row for the response as well.
+            state["error_recorded"] = True
+            defer_handled(state, row)
+        else:
+            collector.record_error(row)
     except Exception as err:
         collector._debug("capture_exception failed", err)
 

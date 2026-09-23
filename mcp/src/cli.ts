@@ -26,6 +26,7 @@ import { homedir } from "node:os";
 import { configFromEnv, SentrinelClient } from "./client";
 import { VERSION } from "./version";
 import { applyUpdate, autoUpdate, fetchManifest, isNewer } from "./update";
+import { profilesToMarkdown, useProfile, activeProfile, DEFAULT_PROFILE } from "./profiles";
 import { mergeBlock, planFromArgs } from "./skill";
 import {
   issuesToMarkdown,
@@ -52,6 +53,8 @@ const USAGE = `sentrinel — Sentrinel for coding agents
   sentrinel activity <db-id> [--period 3600]    wait events, blocking, longest running
   sentrinel dbhealth <db-id> [--period 3600]    connections, deadlocks, temp bytes
   sentrinel resolve|ignore|reopen <id>      needs an "AI agent — may resolve issues" key
+  sentrinel apps                            which apps you have keys for, and which is active
+  sentrinel use <profile>                   work on a different app from now on
   sentrinel update                          fetch the latest server and CLI, keep settings
   sentrinel version                         what is installed, and what is published
   --json                                    raw API response
@@ -172,6 +175,21 @@ export async function run(argv: string[], client: SentrinelClient): Promise<stri
       const res = await client.setIssueStatus(id, status);
       return out(res, () => `Issue ${id} is now ${status}.`);
     }
+    case "apps":
+    case "profiles":
+      return await profilesToMarkdown();
+    case "use": {
+      const [name] = positional;
+      if (!name) throw new Error("usage: sentrinel use <profile>   (see `sentrinel apps`)");
+      const after = await useProfile(name);
+      const now = after.find((p) => p.active)!;
+      return (
+        `Now using **${now.name}**.\n\n` +
+        (process.env.SENTRINEL_PROFILE
+          ? "Note: SENTRINEL_PROFILE is set in this shell and overrides it — unset it to see the change."
+          : "Restart a Claude session to point the `sentrinel` MCP server at it too.")
+      );
+    }
     case "update": {
       const res = await applyUpdate();
       if (!res.ok) throw new Error(res.message);
@@ -227,7 +245,7 @@ if (import.meta.main) {
 
     // Upgrading and reporting a version must work without a key — needing
     // credentials to upgrade is how an install stays old.
-    if (first === "update" || first === "version") {
+    if (first === "update" || first === "version" || first === "apps" || first === "profiles" || first === "use") {
       const text = await run(process.argv.slice(2), null as unknown as SentrinelClient);
       process.stdout.write(text + "\n");
       process.exit(0);

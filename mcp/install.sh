@@ -26,7 +26,7 @@
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 BASE_URL="${SENTRINEL_INSTALL_BASE:-https://sentrinel.dev}"
 INSTALL_DIR="${SENTRINEL_HOME:-$HOME/.sentrinel}"
 BIN_DIR="${SENTRINEL_BIN_DIR:-$HOME/.local/bin}"
@@ -119,7 +119,11 @@ launcher() {
 # The profile picks which key file to read, so one binary serves every app.
 # A variable already in the environment always wins, which keeps a one-off
 # \`SENTRINEL_API_KEY=… sentrinel issues\` working.
-_env="$INSTALL_DIR/env\${SENTRINEL_PROFILE:+.\$SENTRINEL_PROFILE}"
+_p="\${SENTRINEL_PROFILE:-}"
+if [ -z "\$_p" ] && [ -f "$INSTALL_DIR/current" ]; then
+  _p="\$(cat "$INSTALL_DIR/current" 2>/dev/null)"
+fi
+_env="$INSTALL_DIR/env\${_p:+.\$_p}"
 if [ -f "\$_env" ]; then
   while IFS='=' read -r k v; do
     case "\$k" in ''|'#'*) continue ;; esac
