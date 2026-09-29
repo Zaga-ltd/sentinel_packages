@@ -25,7 +25,7 @@ async def sentrinel_tunnel(request: Any) -> Any:
     ```python
     from sentrinel_fastapi import sentrinel_tunnel
 
-    app.add_route("/api/_sentrinel", sentrinel_tunnel, methods=["POST"])
+    app.add_route("/api/sentrinel", sentrinel_tunnel, methods=["POST"])
     ```
 
     Then point the browser SDK's ``endpoint`` at that path.

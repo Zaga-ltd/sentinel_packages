@@ -2,6 +2,15 @@ node_modules/
 *.log
 sentrinel_flutter/.dart_tool/
 sentrinel_flutter/pubspec.lock
+sentrinel_flutter_integration/.dart_tool/
+sentrinel_flutter_integration/pubspec.lock
+.build/
+.swiftpm/
+Package.resolved
+sentrinel_swift/.build/
+sentrinel_kotlin/.gradle/
+sentrinel_kotlin/build/
+sentrinel_kotlin/.kotlin/
 examples/fieldops/mobile/build/
 examples/fieldops/mobile/.dart_tool/
 examples/fieldops/mobile/pubspec.lock
@@ -17,5 +26,4 @@ Claude/
 .claude/
 *.pem
 *.key
-.env
-.env.*
+config.bat

@@ -1,8 +1,12 @@
 # sentrinel — Flutter & Dart
 
 Records every request your app makes, every error it hits, and the logs around
-them — and sends `traceparent` so the backend continues the *same* trace. A tap
-and the server work it caused land on one timeline.
+them — and sends `traceparent` to your own backends so they continue the *same*
+trace. A tap and the server work it caused land on one timeline.
+
+On Flutter, use [`sentrinel_flutter`](../sentrinel_flutter_integration) — it
+wires everything below for you. This package is the pure-Dart core, also usable
+from CLIs and server-side Dart.
 
 ## Install
 
@@ -21,18 +25,21 @@ dependencies:
 ```dart
 import 'package:sentrinel/sentrinel.dart';
 
-void main() {
-  Sentrinel.init(
-    serverUrl: 'https://api.sentrinel.dev',
-    appName: 'mobile-app',
-    env: 'prod',
-    // A Mobile app key: it ships in the bundle, so it is issued to send only
-    // what a phone sends — a leaked one cannot post a replay or read anything.
-    apiKey: const String.fromEnvironment('SENTRINEL_API_KEY'),
-    consumerIdentifier: 'ios_app',
-  );
-  runApp(const MyApp());
-}
+void main() => Sentrinel.guard(() {
+      Sentrinel.init(
+        serverUrl: 'https://api.sentrinel.dev',
+        appName: 'mobile-app',
+        env: 'prod',
+        // A Mobile app key: it ships in the bundle, so it is issued to send only
+        // what a phone sends — a leaked one cannot post a replay or read anything.
+        apiKey: const String.fromEnvironment('SENTRINEL_API_KEY'),
+        release: '1.4.2',
+        // Your own backends. Only these receive traceparent and the
+        // x-sentrinel-consumer / x-sentrinel-device headers.
+        tracePropagationTargets: ['api.example.com'],
+      );
+      runApp(const MyApp());
+    });
 ```
 
 Then send through the wrapped client and every call is recorded:
@@ -41,6 +48,44 @@ Then send through the wrapped client and every call is recorded:
 final client = Sentrinel.httpClient();          // or: httpClient(inner: myClient)
 await client.get(Uri.parse('https://api.example.com/v1/orders'));
 ```
+
+Using Dio? Route it through the same client with the Dio team's
+[`dio_compatibility_layer`](https://pub.dev/packages/dio_compatibility_layer):
+
+```dart
+final dio = Dio()..httpClientAdapter = ConversionLayerAdapter(Sentrinel.httpClient());
+```
+
+### Who the traffic belongs to
+
+Every install has a stable id (`Sentrinel.deviceId`). Until someone signs in,
+requests, errors and logs are filed under `guest:<deviceId>` — each install its
+own consumer. Tell Sentrinel who the user is:
+
+```dart
+Sentrinel.identify(user.id);   // after sign-in
+                               // at launch, when a saved session is restored
+                               // after the profile changes
+Sentrinel.identify(null);      // on sign-out — back to guest:<deviceId>
+```
+
+No custom guest ids needed. Every record also carries `device.id`, and the
+wrapped client sends `x-sentrinel-consumer` and `x-sentrinel-device` to your
+propagation targets, so the backend SDKs file server-side errors under the same
+person. `consumerIdentifier` at init (or `setConsumer`) pins a fixed value — a
+tenant, a kiosk — until `identify` replaces it; prefer `identify`.
+
+### The device
+
+`dart:io` knows the OS (and the iOS version). Feed the rest from
+`device_info_plus` so the dashboard can split by model and version:
+
+```dart
+final info = await DeviceInfoPlugin().androidInfo;
+Sentrinel.setDeviceInfo(model: info.model, osVersion: info.version.release);
+```
+
+`sentrinel_flutter` sets phone vs tablet from the screen on its own.
 
 ### Context
 
@@ -63,70 +108,66 @@ try {
 }
 ```
 
-For crashes, hand it your zone handler:
+Attribute values can be anything: a `DateTime` is sent as ISO-8601, `NaN` as
+null, an enum by name, anything else by `toJson()` or `toString()`.
+
+### Filtering: `beforeSend`
 
 ```dart
-runZonedGuarded(
-  () => runApp(const MyApp()),
-  (e, s) => Sentrinel.captureError(e, s),
+Sentrinel.init(
+  // …
+  beforeSend: (kind, record) {
+    // kind: request · error · log · span · event
+    if (kind == 'log' && record['category'] == 'debug') return null; // drop
+    return record;                                                   // or rewrite
+  },
 );
 ```
 
-### Flushing
+Runs before a crash report is written to disk, so what it removes is never
+stored either. A hook that throws drops the record.
 
-Batches go out every 30s by default. A backgrounded app may not get another
-tick, so flush when you lose the foreground:
+Query strings, fragments and userinfo are stripped from URLs in span
+attributes and transport-error messages by default.
 
-```dart
-if (state == AppLifecycleState.paused) Sentrinel.flush();
-```
+### Flushing and the lifecycle
 
-## Crash reporting
-
-Uncaught Dart errors are captured automatically and **written to disk before the
-process dies**, then sent on the next launch. That last part is what makes it
-crash reporting rather than error reporting: the ordinary buffer flushes on a
-30-second timer, and a crashing app never gets there.
+Batches go out every 30s by default. A backgrounded app may never get another
+tick, so tell Sentrinel when it leaves and returns (`sentrinel_flutter` does
+this for you):
 
 ```dart
-void main() => Sentrinel.guard(() {
-      Sentrinel.init(
-        serverUrl: 'https://api.sentrinel.dev',
-        appName: 'mobile-app',
-        // Where reports wait between the crash and the next launch. Without a
-        // real path this falls back to the system temp directory, which the OS
-        // is free to clear — fine for development, not for shipping.
-        storagePath: appSupportDir.path,
-      );
-
-      // Flutter handles its own errors before any zone sees them, so these two
-      // lines are not optional. They live in your app because the types come
-      // from package:flutter and dart:ui, which this package does not depend on
-      // — that is what keeps it usable from plain Dart.
-      FlutterError.onError =
-          (d) => Sentrinel.flutterErrorHandler(d.exception, d.stack);
-      PlatformDispatcher.instance.onError = (e, s) {
-        Sentrinel.platformErrorHandler(e, s);
-        return true;
-      };
-
-      runApp(const MyApp());
-    });
+Sentrinel.onBackground(); // ends the session with its duration, flushes
+Sentrinel.onForeground(); // same session within 30s, a new one after
 ```
 
-What gets caught, and how it is labelled in `sentrinel.mechanism`:
+## Errors and crashes
 
-| Source | Mechanism | Covered |
+| Source | Mechanism | Reported as |
 | --- | --- | --- |
-| Async errors escaping to the zone | `runZonedGuarded` | ✅ via `guard()` |
-| Flutter build/layout/paint errors | `FlutterError.onError` | ✅ with the wiring above |
-| Errors reaching the engine | `PlatformDispatcher.onError` | ✅ with the wiring above |
-| Errors on other isolates | `Isolate.onError` | ✅ automatic |
+| Async errors escaping to the zone | `runZonedGuarded` via `guard()` | unhandled; session `errored` |
+| Flutter build/layout/paint errors | `FlutterError.onError` | unhandled; session `errored` (`silent` ones skipped) |
+| Errors reaching the engine | `PlatformDispatcher.onError` | unhandled; session `errored` |
+| Errors on spawned isolates | `Isolate.onError` | unhandled; session `errored` |
+| `captureError(e, s, fatal: true)` | your call | crash: written to disk, session `crashed` |
 | Native iOS/Android crashes, ANRs | — | ❌ not covered |
 
-Every report carries the OS, OS version, locale and core count, the session id,
-and the last 25 breadcrumbs. HTTP requests leave breadcrumbs on their own; add
-your own for navigation and taps:
+Unhandled errors are sent within about a second — a Flutter app keeps running
+after them, so they are not counted as crashes.
+
+A **fatal** error is the app saying it is about to die. It is written to disk
+**before `captureError` returns**, and also sent immediately; its disk copy is
+removed once the server acknowledges it, so it is never delivered twice. If the
+process dies first, the next launch sends it. A replay that fails (offline) is
+kept and retried on the next flush and the next launch — never deleted merely
+because it was read. The queue is bounded: 50 records / 256 KB per run.
+
+Where there is no disk — Flutter web, or `persistCrashes: false` — a fatal error
+goes straight to the network.
+
+Every report carries the OS, OS version, locale and core count, the install id,
+the session id, and the last 25 breadcrumbs. HTTP requests leave breadcrumbs on
+their own; add your own for navigation and taps:
 
 ```dart
 Sentrinel.addBreadcrumb('opened checkout', category: 'navigation');
@@ -134,29 +175,34 @@ Sentrinel.addBreadcrumb('opened checkout', category: 'navigation');
 
 ### Sessions
 
-`init()` writes a session marker and `close()` removes it. A marker still there
-on the next launch means the previous run never shut down cleanly, which is
-reported as an `UnfinishedSession` error and exposed as
-`Sentrinel.previousRunCrashed`.
+`init()` starts a session and writes a marker; `close()` and `onBackground()`
+end it and remove the marker. A marker still there on the next launch means the
+previous run never shut down cleanly: it is reported as a session with status
+`crashed` (a fatal error was recorded) or `abnormal` (killed without one), and
+`Sentrinel.previousRunCrashed` is true.
 
-That is the honest definition: a hard crash, a force-quit and an OS kill all
-look identical from inside the next launch.
+That is the honest definition: a hard crash, a force-quit and an OS kill of a
+foreground app all look identical from inside the next launch. Sessions only get
+worse: `ok` → `errored` → `abnormal` / `crashed`.
 
 ## What it will not do
 
 - **Block your app.** Every call is buffered; nothing waits on the network.
-- **Grow without bound.** Buffers cap at 500 requests / 500 logs / 200 errors,
-  oldest dropped first, and `collector.droppedRecords` tells you how many.
-- **Retry forever.** A batch that cannot be sent is dropped. On a device that
-  may be offline for hours, stale telemetry is worth less than a working app.
+- **Grow without bound.** Buffers cap at 500 requests / 500 logs / 500 spans /
+  200 errors, oldest dropped first, and `collector.droppedRecords` tells you how
+  many.
+- **Flood the radio.** At most four posts in flight; spans go in one batch.
+- **Retry forever.** A live batch that cannot be sent is dropped. Only crash
+  reports, which are also on disk, are retried.
+- **Talk to third parties.** No `traceparent` or identity headers except to
+  `tracePropagationTargets` (and same-origin on web).
+- **Close your client.** An `httpClient` you pass in is yours.
 - **Spam your console.** One warning per process if the server rejects a batch.
 - **Crash when uninitialised.** Every call before `init()` is a no-op.
 - **Catch native crashes.** A segfault in an iOS or Android library, or an ANR,
-  kills the process below Dart and leaves nothing for this to report. That needs
-  native crash handlers and a symbolication pipeline.
-- **Symbolicate release stack traces.** An obfuscated Flutter release build
-  produces traces this cannot un-obfuscate; upload of Dart symbol files, dSYMs
-  and ProGuard mappings does not exist yet.
+  kills the process below Dart and leaves nothing for this to report.
+- **Symbolicate release stack traces.** Upload of Dart symbol files, dSYMs and
+  ProGuard mappings does not exist yet.
 
 ## Verify it end to end
 

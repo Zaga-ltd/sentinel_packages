@@ -11,6 +11,8 @@
 //   sentrinel skill install            ~/.claude/skills/sentrinel/   (Claude)
 //   sentrinel skill install --cursor   .cursor/rules/sentrinel.mdc   (Cursor)
 //   sentrinel skill install --agents   ./AGENTS.md                   (Codex & co)
+//   sentrinel skill install --windsurf .windsurf/rules/sentrinel.md  (Windsurf)
+//   sentrinel skill install --zed      ./.rules                      (Zed)
 //   sentrinel skill install --dir P    anywhere else
 //
 // Everything here is a pure function of its inputs — the plan is computed,
@@ -47,6 +49,11 @@ export function absolutize(md: string): string {
 export interface PlannedFile {
   path: string;
   content: string;
+  /**
+   * A single file other people write in too (AGENTS.md, Zed's .rules): the
+   * content goes into our delimited block with mergeBlock, never over theirs.
+   */
+  merge?: boolean;
 }
 
 export interface Plan {
@@ -92,11 +99,29 @@ export function cursorRule(): string {
   ].join("\n");
 }
 
+/**
+ * Windsurf rules are Markdown with a trigger in their frontmatter.
+ * `model_decision` loads it when the description matches the task, which is
+ * how a skill is meant to be picked up — not on every prompt.
+ */
+export function windsurfRule(): string {
+  return [
+    "---",
+    "trigger: model_decision",
+    `description: ${description()}`,
+    "---",
+    "",
+    absolutize(body()),
+  ].join("\n");
+}
+
 export interface PlanOptions {
   install: boolean;
   all: boolean;
   cursor: boolean;
   agents: boolean;
+  windsurf?: boolean;
+  zed?: boolean;
   dir?: string;
   home: string;
   cwd: string;
@@ -119,12 +144,28 @@ export function plan(o: PlanOptions): Plan {
     return { print: written([path], "Cursor reads it from .cursor/rules/."), files: [{ path, content: cursorRule() }] };
   }
 
+  if (o.windsurf) {
+    const path = o.dir ? join(o.dir, "sentrinel.md") : join(o.cwd, ".windsurf/rules/sentrinel.md");
+    return { print: written([path], "Windsurf reads it from .windsurf/rules/."), files: [{ path, content: windsurfRule() }] };
+  }
+
   if (o.agents) {
     // A single file others already own, so this one is a merge, not a write.
     const path = o.dir ? join(o.dir, "AGENTS.md") : join(o.cwd, "AGENTS.md");
     return {
       print: written([path], "Codex, Copilot, Amp and anything else that reads AGENTS.md."),
-      files: [{ path, content: agentsBlock() }],
+      files: [{ path, content: agentsBlock(), merge: true }],
+    };
+  }
+
+  if (o.zed) {
+    // Zed's rules are one file at the project root, `.rules` — not a
+    // directory, so `--dir .rules` could only ever fail. Same shape as
+    // AGENTS.md, and merged the same way.
+    const path = o.dir ? join(o.dir, ".rules") : join(o.cwd, ".rules");
+    return {
+      print: written([path], "Zed reads .rules at the project root."),
+      files: [{ path, content: agentsBlock(), merge: true }],
     };
   }
 
@@ -165,6 +206,8 @@ export function planFromArgs(
     all: on(flags.all),
     cursor: on(flags.cursor),
     agents: on(flags.agents) || on(flags["agents-md"]),
+    windsurf: on(flags.windsurf),
+    zed: on(flags.zed),
     dir,
     home: env.home,
     cwd: env.cwd,

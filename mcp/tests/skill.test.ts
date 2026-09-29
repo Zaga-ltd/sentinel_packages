@@ -92,6 +92,22 @@ describe("plan", () => {
   it("honours an explicit directory", () => {
     expect(plan({ ...opts, install: true, dir: "/elsewhere" }).files[0].path).toBe("/elsewhere/SKILL.md");
   });
+
+  it("writes one Windsurf rule, loaded when the task matches", () => {
+    const [f, ...rest] = plan({ ...opts, install: true, windsurf: true }).files;
+    expect(rest).toEqual([]);
+    expect(f.path).toBe("/repo/.windsurf/rules/sentrinel.md");
+    expect(f.content).toStartWith("---\ntrigger: model_decision\ndescription: Work with Sentrinel");
+    expect(f.content).not.toMatch(/\]\(references\//);
+  });
+
+  it("merges into Zed's single .rules file, and AGENTS.md, rather than overwriting them", () => {
+    const [zed] = plan({ ...opts, install: true, zed: true }).files;
+    expect(zed.path).toBe("/repo/.rules");
+    expect(zed.merge).toBe(true);
+    expect(plan({ ...opts, install: true, agents: true }).files[0].merge).toBe(true);
+    expect(plan({ ...opts, install: true, cursor: true }).files[0].merge).toBeFalsy();
+  });
 });
 
 describe("mergeBlock", () => {

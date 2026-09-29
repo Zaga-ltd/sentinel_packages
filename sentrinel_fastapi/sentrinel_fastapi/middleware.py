@@ -243,6 +243,11 @@ class SentrinelMiddleware:
             span_id=generate_span_id(),
             parent_span_id=incoming.parent_span_id if incoming else None,
         )
+        # The install the phone or browser SDK says it is: the one thread that
+        # ties a guest's requests together before anybody has signed in.
+        device = context.device_id(headers.get("x-sentrinel-device"))
+        if device:
+            state["attributes"]["device.id"] = device
         state["scope"] = scope
         state["path"] = path
         state["entry_root_path"] = entry_root_path
@@ -343,8 +348,15 @@ class SentrinelMiddleware:
         elapsed_ms = (finished - started) * 1000.0
         method = scope.get("method", "GET")
         route = route_for(scope, path, entry_root_path)
-        # Identity may only have been decided inside the endpoint.
-        consumer = state.get("consumer") or self._consumer(scope)
+        # Identity may only have been decided inside the endpoint. The header
+        # the phone and browser SDKs send comes last, and only here: at the
+        # start of the request an inner AuthenticationMiddleware has not run,
+        # and a guest id taken then would outrank the user it went on to find.
+        consumer = (
+            state.get("consumer")
+            or self._consumer(scope)
+            or context.client_consumer(headers.get("x-sentrinel-consumer"), cfg.trust_client_consumer)
+        )
 
         try:
             request_size = int(headers.get("content-length") or 0) or probe.request_bytes
@@ -401,7 +413,10 @@ class SentrinelMiddleware:
             logs = state.get("logs") or []
             if logs:
                 for line in logs:
-                    line.setdefault("consumerIdentifier", consumer)
+                    # The handler writes the key, as None when nobody was known
+                    # yet — so it is filled, not defaulted.
+                    if not line.get("consumerIdentifier"):
+                        line["consumerIdentifier"] = consumer
                 self.collector.record_logs(logs)
 
         if not cfg.capture_requests:

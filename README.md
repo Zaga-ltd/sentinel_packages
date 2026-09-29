@@ -9,6 +9,8 @@ agent skill, one repo.
 | [`sentrinel_django/`](sentrinel_django) | Django 3.1 – 6.1 | `pip install "git+https://github.com/Zaga-ltd/sentinel_packages.git#subdirectory=sentrinel_django"` |
 | [`sentrinel_fastapi/`](sentrinel_fastapi) | FastAPI 0.100+, Starlette, any ASGI app | `pip install "git+https://github.com/Zaga-ltd/sentinel_packages.git#subdirectory=sentrinel_fastapi"` |
 | [`sentrinel_flutter_integration/`](sentrinel_flutter_integration) | Flutter apps | a `git:` dependency — see below |
+| [`sentrinel_swift/`](sentrinel_swift) | native iOS / macOS apps | Swift Package Manager: `.package(url: "https://github.com/Zaga-ltd/sentinel_packages.git", branch: "main")`, product `Sentrinel` |
+| [`sentrinel_kotlin/`](sentrinel_kotlin) | native Android / JVM apps | JitPack: `implementation("com.github.Zaga-ltd.sentinel_packages:sentrinel_kotlin:main-SNAPSHOT")` |
 | [`mcp/`](mcp) | Claude Code, Codex and other agents | `curl -fsSL https://sentrinel.dev/install-mcp.sh \| bash` |
 | [`mcp/skill/`](mcp/skill) | the agent skill — how to use those tools well | `sentrinel skill install [--cursor\|--agents]` |
 | [`examples/fieldops/`](examples/fieldops) | a whole project — backend, Flutter app, web console, Postgres, agent — as **one** app, one trace from tap to query | see its README |
@@ -53,22 +55,37 @@ Documentation lives at **[docs.sentrinel.dev](https://docs.sentrinel.dev)** —
 
 # @sentrinel/plugin
 
-Monitoring plugin for [Elysia.js](https://elysiajs.com) apps. Sends metrics, request logs, errors, application logs, and resource usage to a self-hosted [Sentrinel](https://github.com/Zaga-ltd/sentinel) server.
+Monitoring for [Elysia](https://elysiajs.com), Express, Next.js, Bun and the browser. Sends metrics, request logs, errors, application logs, traces and resource usage to [Sentrinel](https://sentrinel.dev).
 
 - **Exact metrics** — request counts, error rates, and response-time percentiles are aggregated in-process before sampling, so dashboards are always accurate.
 - **Sampled request logs** — keep a fraction of successful requests; errors, slow requests, and requests that logged an error are always kept.
 - **Application log capture** — console output during a request is captured (via AsyncLocalStorage) and correlated to that request in the dashboard.
-- **Error tracking** — unhandled exceptions with stack traces.
+- **Error tracking** — thrown exceptions with stack traces, plus uncaught exceptions and unhandled rejections.
 - **Resource usage** — CPU and memory reported on every flush.
-- **Header/body masking** — never ship secrets; mask by pattern.
-- **Distributed tracing** — `traceSpan()`, `traced()`, `sentrinelFetch()` for W3C traceparent propagation.
+- **Masking by default** — Authorization, cookies, API keys, tokens, passwords and card fields are masked with no configuration; your patterns add to the list.
+- **Distributed tracing** — `traceSpan()`, `traced()`, `sentrinelFetch()` for W3C traceparent propagation, in every adapter.
 - **Structured logging** — `getLogger()` with hierarchical categories, correlated attributes, and context inheritance.
+- **Safe at volume** — batches cut to the ingest limits, bounded buffers, retries per data type, a flush on shutdown.
 
 ## Install
 
 ```bash
 bun add "@sentrinel/plugin@github:Zaga-ltd/sentinel_packages"
+npm install "github:Zaga-ltd/sentinel_packages"
 ```
+
+Ships built JavaScript (ESM, CommonJS, types) in `dist/`, so it loads in plain
+Node with `import` or `require()`; Bun runs the TypeScript in `src/`. Elysia is
+an optional peer.
+
+| Import | For |
+|---|---|
+| `@sentrinel/plugin` / `@sentrinel/plugin/elysia` | Elysia, plus tracing, logging, custom metrics |
+| `@sentrinel/plugin/express` | Express |
+| `@sentrinel/plugin/next` | Next.js route handlers and API routes |
+| `@sentrinel/plugin/bun` | `Bun.serve` |
+| `@sentrinel/plugin/browser` | web pages |
+| `@sentrinel/plugin/tunnel` | the server route a web page posts to |
 
 ## Quick start
 
@@ -90,8 +107,7 @@ const app = new Elysia()
         enabled: true,
         sampleRate: 0.25,              // keep 25% of fast successes
         slowRequestThresholdMs: 200,   // always keep slow requests
-        logRequestHeaders: true,
-        maskHeaders: [/^authorization$/i, /^cookie$/i],
+        logRequestHeaders: true,       // credentials are masked by default
       },
 
       logCapture: {
@@ -143,10 +159,11 @@ const app = new Elysia()
       logRequestHeaders: true,
       logRequestBody: true,
       logResponseBody: true,
-      maxBodySize: 65536,                   // 64KB max body capture
-      maskHeaders: [/^authorization$/i, /^cookie$/i, /^x-api-key$/i],
-      maskQueryParams: ["token", "secret", "key"],
-      maskBodyFields: [/^password$/i, /^token$/i, /^credit_card$/i, /^cvv$/i],
+      maxBodySize: 65536,                   // the most of a body ever read
+      // Added to the built-in deny-list, which always applies.
+      maskHeaders: [/^x-tenant-secret$/i],
+      maskQueryParams: ["invite"],
+      maskBodyFields: [/^iban$/i],
     },
 
     // Console log capture
@@ -201,7 +218,7 @@ withContext({ userId: "u_123", tier: "enterprise" }, async () => {
 ### Express adapter
 
 ```ts
-import { sentrinelExpressMiddleware } from "@sentrinel/plugin/express";
+import { sentrinelExpressMiddleware, sentrinelErrorHandler } from "@sentrinel/plugin/express";
 
 app.use(sentrinelExpressMiddleware({
   serverUrl: "http://localhost:3001",
@@ -214,24 +231,35 @@ app.use(sentrinelExpressMiddleware({
   logCapture: { enabled: true, minLevel: "debug" },
   logging: { minLevel: "debug", echo: false },
 }));
+
+app.use("/api", routes);
+app.use(sentrinelErrorHandler());   // after routes: Express hands thrown errors only to error middleware
 ```
 
 ### Next.js adapter
 
-```ts
-import { sentrinelNextMiddleware } from "@sentrinel/plugin/next";
+Wrap route handlers (Node runtime); no middleware.
 
-export const middleware = sentrinelNextMiddleware({
+```ts
+// lib/sentrinel.ts
+import { createSentrinelNext } from "@sentrinel/plugin/next";
+
+export const { withSentrinel } = createSentrinelNext({
   serverUrl: process.env.SENTRINEL_URL!,
   appName: "my-next-app",
   env: process.env.VERCEL_ENV ?? "prod",
   apiKey: process.env.SENTRINEL_API_KEY,
-  requestLogging: { enabled: true, sampleRate: 1.0, slowRequestThresholdMs: 500,
-    logRequestHeaders: true, logRequestBody: true, logResponseBody: true },
-  logCapture: { enabled: true, minLevel: "info" },
-  logging: { minLevel: "debug", echo: false },
+  requestLogging: { enabled: true },
 });
+
+// app/api/orders/[id]/route.ts
+export const GET = withSentrinel(async (request: Request, { params }: { params: Promise<{ id: string }> }) =>
+  Response.json(await getOrder((await params).id))
+);
 ```
+
+The old `sentrinelNextMiddleware` blanked every matched route; it is now a
+pass-through that records nothing (`@sentrinel/plugin/next/middleware`).
 
 ## Options
 
@@ -251,10 +279,14 @@ export const middleware = sentrinelNextMiddleware({
 | `requestLogging.logRequestHeaders` | `false` | Include request headers |
 | `requestLogging.logRequestBody` | `false` | Include request body |
 | `requestLogging.logResponseBody` | `false` | Include response body |
-| `requestLogging.maxBodySize` | `65536` | Max body bytes to capture |
-| `requestLogging.maskHeaders` | `[]` | Headers to redact |
-| `requestLogging.maskQueryParams` | `[]` | Query params to redact |
-| `requestLogging.maskBodyFields` | `[]` | Body fields to redact (recursive) |
+| `requestLogging.maxBodySize` | `65536` | Most body bytes ever read |
+| `requestLogging.maskHeaders` | built-in list | Extra headers to redact |
+| `requestLogging.maskQueryParams` | built-in list | Extra query params to redact |
+| `requestLogging.maskBodyFields` | built-in list | Extra body fields to redact (recursive; JSON, form, multipart) |
+| `consumerHeaderPattern` | — | Trust `x-sentrinel-consumer` values beyond `guest:` ids |
+| `processHooks` | on (off under `NODE_ENV=test`) | Flush on SIGTERM/SIGINT/exit; report uncaught errors |
+| `sendTimeoutMs` | `10000` | Per-POST timeout |
+| `retry` / `buffer` | see PLUGIN.md | Retry-queue and buffer bounds |
 | `logCapture.enabled` | `false` | Capture console output per request |
 | `logCapture.minLevel` | `"info"` | Minimum level to capture |
 | `logCapture.maxPerRequest` | `50` | Per-request log cap |

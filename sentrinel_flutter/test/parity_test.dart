@@ -8,40 +8,8 @@ import 'package:sentrinel/src/models.dart';
 import 'package:test/test.dart';
 
 void main() {
-  group('route templates', () {
-    test('ids collapse so one endpoint stays one endpoint', () {
-      expect(routeTemplate('/orders/8f3a1b2c'), '/orders/{id}');
-      expect(routeTemplate('/orders/12345'), '/orders/{id}');
-      expect(
-        routeTemplate('/users/3f2504e0-4f89-11d3-9a0c-0305e82c3301/orders'),
-        '/users/{id}/orders',
-      );
-    });
-
-    test('several ids in one path all collapse', () {
-      expect(routeTemplate('/users/42/orders/99'), '/users/{id}/orders/{id}');
-    });
-
-    // The dangerous direction: merging endpoints that are not the same one.
-    test('ordinary words are never mistaken for ids', () {
-      expect(routeTemplate('/api/v1/orders'), '/api/v1/orders');
-      expect(routeTemplate('/subscriptions'), '/subscriptions');
-      expect(routeTemplate('/notifications/unread'), '/notifications/unread');
-      // Long, but a word — no digits, so it stays.
-      expect(routeTemplate('/recommendations'), '/recommendations');
-    });
-
-    test('a version segment survives', () {
-      // `v1` is digits-adjacent but not an id; collapsing it would merge every
-      // version of every endpoint into one.
-      expect(routeTemplate('/v1/orders'), '/v1/orders');
-    });
-
-    test('empty and root paths are safe', () {
-      expect(routeTemplate(''), '/');
-      expect(routeTemplate('/'), '/');
-    });
-  });
+  // The route rules themselves are in route_path_test.dart, run against the
+  // server's own cases.
 
   group('every record names its owner', () {
     test('a log line carries the consumer', () {

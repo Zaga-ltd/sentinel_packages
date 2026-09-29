@@ -1,4 +1,5 @@
-// The Flutter half: the errors a zone never sees, frames, and navigation.
+// The Flutter half: the errors a zone never sees, the app lifecycle, frames,
+// the device, and navigation.
 //
 // These run against a real widget binding, because that is the only place the
 // behaviour exists — FlutterError.onError and the frame timing callbacks do not
@@ -7,7 +8,7 @@
 
 import 'dart:convert';
 import 'dart:io';
-import 'dart:ui' show FrameTiming, PlatformDispatcher;
+import 'dart:ui' show FrameTiming, PlatformDispatcher, Size;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -59,7 +60,7 @@ void main() {
   });
 
   group('errors a zone never sees', () {
-    test('a framework error is reported as a crash', () {
+    test('a framework error is reported unhandled, not as a crash', () async {
       final prior = FlutterError.onError;
       SentrinelFlutter.installErrorHandlers();
 
@@ -68,13 +69,30 @@ void main() {
         stack: StackTrace.current,
         library: 'widgets library',
       ));
+      await Sentrinel.flush();
 
-      // On disk immediately — a framework error can be the last thing that
-      // happens before the app is gone.
-      final pending = File('${storage.path}/pending.ndjson').readAsStringSync();
-      expect(pending, contains('build blew up'));
-      expect(pending, contains('FlutterError.onError'));
+      final error = captured.rows('/api/ingest/errors', 'errors').single;
+      expect(error['errorMessage'], contains('build blew up'));
+      expect(error['attributes']['sentrinel.mechanism'], 'FlutterError.onError');
+      expect(error['attributes']['sentrinel.handled'], isFalse);
+      expect(error['attributes']['flutter.library'], 'widgets library');
+      expect((error['attributes'] as Map).containsKey('sentrinel.fatal'), isFalse);
+      // An overflow or a failed image leaves the app running. Held on disk and
+      // counted as a crash, it made the crash-free rate meaningless.
+      expect(File('${storage.path}/pending.ndjson').existsSync(), isFalse);
+      final statuses = captured.rows('/api/ingest/sessions', 'sessions').map((s) => s['status']);
+      expect(statuses, contains('errored'));
+      expect(statuses, isNot(contains('crashed')));
 
+      FlutterError.onError = prior;
+    });
+
+    test('a silent error is not reported', () async {
+      final prior = FlutterError.onError;
+      SentrinelFlutter.installErrorHandlers();
+      FlutterError.onError!(FlutterErrorDetails(exception: StateError('benign'), silent: true));
+      await Sentrinel.flush();
+      expect(captured.rows('/api/ingest/errors', 'errors'), isEmpty);
       FlutterError.onError = prior;
     });
 
@@ -92,7 +110,23 @@ void main() {
       FlutterError.onError = prior;
     });
 
-    test('an engine error is reported and still handled', () {
+    test('installing twice does not report every error twice', () async {
+      final prior = FlutterError.onError;
+      final priorPlatform = PlatformDispatcher.instance.onError;
+      FlutterError.onError = (_) {};
+      SentrinelFlutter.installErrorHandlers();
+      SentrinelFlutter.installErrorHandlers();
+
+      FlutterError.onError!(FlutterErrorDetails(exception: StateError('once')));
+      PlatformDispatcher.instance.onError!(ArgumentError('once too'), StackTrace.current);
+      await Sentrinel.flush();
+
+      expect(captured.rows('/api/ingest/errors', 'errors'), hasLength(2));
+      FlutterError.onError = prior;
+      PlatformDispatcher.instance.onError = priorPlatform;
+    });
+
+    test('an engine error is reported and still handled', () async {
       final prior = PlatformDispatcher.instance.onError;
       SentrinelFlutter.installErrorHandlers();
 
@@ -100,13 +134,118 @@ void main() {
         ArgumentError('escaped to the engine'),
         StackTrace.current,
       );
+      await Sentrinel.flush();
 
       expect(handled, isTrue, reason: 'returning false would crash the app');
-      expect(
-        File('${storage.path}/pending.ndjson').readAsStringSync(),
-        contains('escaped to the engine'),
-      );
+      final error = captured.rows('/api/ingest/errors', 'errors').single;
+      expect(error['errorMessage'], contains('escaped to the engine'));
+      expect(error['attributes']['sentrinel.mechanism'], 'PlatformDispatcher.onError');
       PlatformDispatcher.instance.onError = prior;
+    });
+  });
+
+  group('the app lifecycle', () {
+    // A backgrounded app may be killed by the OS without another line of Dart
+    // running. Before this, nothing flushed on backgrounding unless the app
+    // wired it up, and every such kill left the session marker behind — so the
+    // next launch reported an `abnormal` session for a user who merely
+    // switched apps.
+    Future<void> initFlutter() => SentrinelFlutter.init(SentrinelOptions(
+          serverUrl: 'https://api.test',
+          appName: 'mobile-app',
+          apiKey: 'k',
+          release: '2.0.0',
+          storagePath: storage.path,
+          httpClient: captured.client(),
+          trackFrames: false,
+          trackAppStart: false,
+        ));
+
+    tearDown(SentrinelFlutter.close);
+
+    test('backgrounding flushes and ends the session with its duration', () async {
+      await initFlutter();
+      Sentrinel.info('before background');
+
+      final binding = WidgetsBinding.instance;
+      binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+      binding.handleAppLifecycleStateChanged(AppLifecycleState.paused);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+
+      expect(captured.rows('/api/ingest/logs', 'logs').map((l) => l['message']),
+          contains('before background'));
+      final ended =
+          captured.rows('/api/ingest/sessions', 'sessions').where((s) => s['durationMs'] != null);
+      expect(ended, isNotEmpty);
+      expect(ended.last['status'], 'ok');
+      expect(File('${storage.path}/session.json').existsSync(), isFalse,
+          reason: 'an OS kill from here is not an abnormal exit');
+
+      binding.handleAppLifecycleStateChanged(AppLifecycleState.hidden);
+      binding.handleAppLifecycleStateChanged(AppLifecycleState.inactive);
+      binding.handleAppLifecycleStateChanged(AppLifecycleState.resumed);
+      expect(File('${storage.path}/session.json').existsSync(), isTrue,
+          reason: 'back in the foreground, a crash must be noticed again');
+    });
+
+    test('initialising twice installs one observer and one set of handlers', () async {
+      final prior = FlutterError.onError;
+      FlutterError.onError = (_) {};
+      await initFlutter();
+      await initFlutter();
+      FlutterError.onError!(FlutterErrorDetails(exception: StateError('after two inits')));
+      await Sentrinel.flush();
+      expect(
+        captured
+            .rows('/api/ingest/errors', 'errors')
+            .where((e) => '${e['errorMessage']}'.contains('after two inits')),
+        hasLength(1),
+      );
+      FlutterError.onError = prior;
+    });
+  });
+
+  group('the device', () {
+    TestFlutterView view() =>
+        WidgetsBinding.instance.platformDispatcher.views.first as TestFlutterView;
+
+    tearDown(() {
+      debugDefaultTargetPlatformOverride = null;
+      view().resetPhysicalSize();
+      view().resetDevicePixelRatio();
+    });
+
+    Future<Map<String, dynamic>> eventsEnvelope() async {
+      await SentrinelFlutter.init(SentrinelOptions(
+        serverUrl: 'https://api.test',
+        appName: 'mobile-app',
+        storagePath: storage.path,
+        httpClient: captured.client(),
+        trackFrames: false,
+        trackAppStart: false,
+        trackLifecycle: false,
+      ));
+      Sentrinel.track('opened');
+      await Sentrinel.flush();
+      await SentrinelFlutter.close();
+      return captured.byPath['/api/ingest/events']!.last;
+    }
+
+    test('a phone-sized screen is a phone', () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.android;
+      view().physicalSize = const Size(1080, 2400);
+      view().devicePixelRatio = 3;
+      expect((await eventsEnvelope())['deviceType'], 'mobile');
+    });
+
+    test('a tablet-sized screen is a tablet', () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      view().physicalSize = const Size(2048, 2732);
+      view().devicePixelRatio = 2;
+      expect((await eventsEnvelope())['deviceType'], 'tablet');
+      // Overrides outlive an init; leave the default behind for later tests.
+      Sentrinel.setDeviceInfo(deviceType: 'mobile');
     });
   });
 
@@ -129,6 +268,18 @@ void main() {
       expect(tracker.frozenFrames, 1, reason: 'a 900ms frame is not merely slow');
     });
 
+    test('the budget is the display\'s, so 120Hz is judged at 8ms', () {
+      // At 120Hz a 12ms frame missed a vsync — a visible stutter on that
+      // screen, even though it would have met a 60Hz budget.
+      final tracker = FrameTracker(budgetMs: 1000 / 120);
+      // ignore: invalid_use_of_visible_for_testing_member
+      tracker.consumeForTest(_timingUs(12000));
+      expect(tracker.slowFrames, 1);
+
+      // Unset, it comes from the display the binding reports.
+      expect(FrameTracker().budgetMs, closeTo(displayFrameBudgetMs() ?? 16, 0.01));
+    });
+
     test('a window is reported as one summary, not one record per frame', () async {
       final tracker = FrameTracker(budgetMs: 16);
       for (var i = 0; i < 500; i++) {
@@ -147,8 +298,7 @@ void main() {
   });
 
   group('navigation', () {
-    testWidgets('a route change leaves a breadcrumb and sets the screen',
-        (tester) async {
+    testWidgets('a route change leaves a breadcrumb and sets the screen', (tester) async {
       final observer = SentrinelNavigatorObserver();
 
       await tester.pumpWidget(MaterialApp(
@@ -174,8 +324,7 @@ void main() {
       expect(pending, contains('navigation'));
     });
 
-    testWidgets('popping reports the route underneath, not the one that left',
-        (tester) async {
+    testWidgets('popping reports the route underneath, not the one that left', (tester) async {
       final observer = SentrinelNavigatorObserver();
       await tester.pumpWidget(MaterialApp(
         navigatorObservers: [observer],
@@ -191,16 +340,16 @@ void main() {
       navigator.pop();
       await tester.pumpAndSettle();
 
-      expect(observer.currentRoute, '/',
-          reason: 'after a pop the user is on the route underneath');
+      expect(observer.currentRoute, '/', reason: 'after a pop the user is on the route underneath');
     });
   });
 }
 
 /// A FrameTiming with a known total span.
-FrameTiming _timing(int totalMs) {
+FrameTiming _timing(int totalMs) => _timingUs(totalMs * 1000);
+
+FrameTiming _timingUs(int end) {
   const start = 0;
-  final end = totalMs * 1000; // microseconds
   return FrameTiming(
     vsyncStart: start,
     buildStart: start,

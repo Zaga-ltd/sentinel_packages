@@ -21,10 +21,17 @@ total execution time by default.
 - `sort: calls` — the most frequent. A cheap query at 50,000 calls a minute is
   an N+1 in disguise, and the fix is in the application, not the query.
 
-Each row carries the full query text, call count, cache hit ratio and the
-endpoints that called it — which is the link back to your code. A low cache hit
-ratio on a hot shape means it is reading from disk: usually a missing index, or
-a working set that no longer fits.
+Each row carries the query text, call count, cache hit ratio and the database
+**roles** that ran it, with their call counts (`run by: app (1,234 calls)`).
+`pg_stat_statements` does not know which endpoint sent a query, so neither does
+this output — the trace does: `get_trace` on a slow request shows the query as
+a span under the route that issued it. A low cache hit ratio on a hot shape
+means it is reading from disk: usually a missing index, or a working set that
+no longer fits.
+
+Query text is masked on the database host unless the collector was told
+otherwise: a `?` may be a stripped literal, not a bind parameter, so do not
+read `WHERE id = ?` as proof the application binds its values.
 
 ## `db_activity` — what it was waiting on
 
@@ -53,10 +60,12 @@ almost always contention rather than cost.
 
 ## Turning a finding into a fix
 
-The output names endpoints, not files. Search the repo for the route, then for
-the query text or the ORM call that would produce that shape. State which one
-you matched and how confident you are — the shape-to-code step is the one place
-in this workflow where you are inferring rather than reading.
+The output names query shapes and database roles, not endpoints or files. If a
+slow request's trace shows the query, its route is where to start; otherwise
+search the repo for the query text or the ORM call that would produce that
+shape. State which one you matched and how confident you are — the
+shape-to-code step is the one place in this workflow where you are inferring
+rather than reading.
 
 If the collector is not installed for this app, the database tools return
 nothing. That is not an error to work around: say it, and point at

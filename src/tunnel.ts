@@ -12,7 +12,7 @@
  * Hono, Next route handlers, TanStack Start, Remix and Deno all speak.
  *
  * ```ts
- * // app/api/_sentrinel/route.ts  (Next)
+ * // app/api/sentrinel/route.ts  (Next)
  * import { createSentrinelTunnel } from "@sentrinel/plugin/tunnel";
  *
  * const tunnel = createSentrinelTunnel({
@@ -24,9 +24,18 @@
  *
  * export const POST = tunnel;
  * ```
+ *
+ * ## Browser timings are client data
+ *
+ * A fetch timed in the browser includes the network, the queue in the
+ * browser, and whatever the page did before the request left. It is a
+ * different measurement from the one the backend makes of the same call. They
+ * used to be rolled up into `/api/ingest/metrics`, where they landed in the
+ * same endpoint rows as the backend's (those rows have no module column), so
+ * `GET /api/orders` counted every call twice and its p95 was a blend of two
+ * unrelated numbers. They are now sent only as request rows marked
+ * `kind: "client"` in the `web` module, and as client spans on the trace.
  */
-
-import { rollUpConsumers, rollUpEndpoints, type RollupRequest } from "./rollup";
 
 export interface SentrinelTunnelOptions {
   /** The Sentrinel API, e.g. `https://api.sentrinel.dev`. */
@@ -42,7 +51,11 @@ export interface SentrinelTunnelOptions {
   /**
    * Which part of the project this page is — `web`, `admin`, `checkout`. An app
    * is the whole project; the browser reports as a module of it beside the
-   * backend and the phone. Defaults to the key's name.
+   * backend and the phone. Defaults to `web`.
+   *
+   * Not to the key's name, as it once did: the tunnel usually runs on the
+   * backend with the backend's own server key, so defaulting to the key filed
+   * every browser record under the backend's module.
    */
   module?: string;
   /**
@@ -80,11 +93,25 @@ export interface TunnelBatch {
 const DEFAULT_MAX_BODY = 512 * 1024;
 
 /**
- * Client spans forwarded per batch. Each is its own ingest call (a trace and
- * its spans travel together), so a page firing hundreds of calls between
- * flushes must not fan out into hundreds of requests from this server.
+ * Where the browser SDK posts by default, and where it used to.
+ *
+ * `/api/_sentrinel` was the old default and pages built against it are still
+ * deployed; Next's App Router cannot serve it (a `_` folder is private), which
+ * is why the default moved. A server mounting the tunnel by path should answer
+ * both — `isSentrinelTunnelPath` does.
  */
-const MAX_CLIENT_SPANS = 50;
+export const SENTRINEL_TUNNEL_PATHS = ["/api/sentrinel", "/api/_sentrinel"] as const;
+
+export function isSentrinelTunnelPath(pathname: string): boolean {
+  return (SENTRINEL_TUNNEL_PATHS as readonly string[]).includes(pathname.replace(/\/+$/, ""));
+}
+
+/**
+ * Client spans forwarded per batch — the trace ingest's own per-call cap. They
+ * travel together in one call, so a busy page costs this server one request,
+ * not one per fetch.
+ */
+const MAX_CLIENT_SPANS = 500;
 
 /** The trace payload for a request the page propagated, or null if it did not. */
 function clientSpan(r: Record<string, unknown>): Record<string, unknown> | null {
@@ -97,22 +124,35 @@ function clientSpan(r: Record<string, unknown>): Record<string, unknown> | null 
   const status = Number(r.statusCode) || 0;
   const name = `${String(r.method ?? "GET")} ${String(r.path ?? "/")}`.slice(0, 200);
   const statusCode = status === 0 || status >= 500 ? "ERROR" : "OK";
+  const attrs = (r.attributes && typeof r.attributes === "object" ? r.attributes : {}) as Record<string, unknown>;
   return {
     traceId,
+    requestLogId: typeof r.id === "string" ? r.id : undefined,
     name,
     startTime: start.toISOString(),
     endTime: new Date(start.getTime() + durationMs).toISOString(),
     durationMs,
-    statusCode,
+    statusCode: status,
     spans: [
       {
         id: spanId,
+        traceId,
+        parentId: null,
         name,
         kind: "CLIENT",
         startTime: start.toISOString(),
+        endTime: new Date(start.getTime() + durationMs).toISOString(),
         durationMs,
         statusCode,
-        attributes: { "sentrinel.source": "browser", "http.method": r.method, "http.route": r.path, "http.status_code": status },
+        attributes: {
+          "sentrinel.source": "browser",
+          "sentrinel.kind": "client",
+          "http.method": r.method,
+          "http.route": r.path,
+          "http.status_code": status,
+          ...(r.consumerIdentifier ? { "sentrinel.consumer": r.consumerIdentifier } : {}),
+          ...(attrs["device.id"] ? { "device.id": attrs["device.id"] } : {}),
+        },
       },
     ],
   };
@@ -149,7 +189,7 @@ export function createSentrinelTunnel(
     env,
     apiKey,
     release,
-    module,
+    module = "web",
     maxBodyBytes = DEFAULT_MAX_BODY,
     maxReplayBytes = DEFAULT_MAX_REPLAY_BODY,
     consumerIdentifier,
@@ -214,8 +254,15 @@ export function createSentrinelTunnel(
       ...(consumer ? { consumerIdentifier: consumer } : {}),
       ...(effectiveRelease ? { attributes: withRelease(e.attributes, effectiveRelease) } : {}),
     }));
+    // Marked as client measurements, so nothing downstream mistakes a timing
+    // taken in the browser for the server's own.
     const requests = take(batch.requests, LIMITS.requests).map((r) => ({
       ...r,
+      kind: "client",
+      attributes: {
+        ...(r.attributes && typeof r.attributes === "object" ? (r.attributes as Record<string, unknown>) : {}),
+        "sentrinel.kind": "client",
+      },
       ...(consumer ? { consumerIdentifier: consumer } : {}),
     }));
     const sessions = take(batch.sessions, LIMITS.sessions).map((s) => ({
@@ -249,29 +296,16 @@ export function createSentrinelTunnel(
     if (errors.length) sends.push(forward("/api/ingest/errors", { appName, module, env, errors }));
     if (requests.length) {
       sends.push(forward("/api/ingest/requests", { appName, module, env, requests }));
-      // The same requests, aggregated. Both are needed and they are not
-      // interchangeable: the rows above are the log view, and this is every
-      // headline number on the Apps and Overview pages. Derived here rather
-      // than in the page so a browser SDK ships no extra bytes for it, and so
-      // the arithmetic stays next to the server's — see rollup.ts.
-      sends.push(
-        forward("/api/ingest/metrics", {
-          appName,
-          module,
-          env,
-          timestamp: new Date().toISOString(),
-          endpoints: rollUpEndpoints(requests as unknown as RollupRequest[]),
-          consumers: rollUpConsumers(requests as unknown as RollupRequest[]),
-        }),
-      );
       // A call the page sent a traceparent on is where a trace starts: the
       // backend's span continues it by parent id. Forwarded as a client span so
       // the click itself is on the waterfall — without it the trace begins at
-      // the server and the browser's part of the journey is invisible.
-      for (const r of requests.slice(0, MAX_CLIENT_SPANS)) {
-        const span = clientSpan(r);
-        if (span) sends.push(forward("/api/ingest/traces", { appName, module, env, ...span }));
-      }
+      // the server and the browser's part of the journey is invisible. All of
+      // them in one batched call.
+      const traces = requests
+        .map((r) => clientSpan(r))
+        .filter((t): t is Record<string, unknown> => t !== null)
+        .slice(0, MAX_CLIENT_SPANS);
+      if (traces.length) sends.push(forward("/api/ingest/traces", { appName, module, env, traces }));
     }
     if (sessions.length) sends.push(forward("/api/ingest/sessions", { appName, module, env, sessions }));
     if (events.length) {

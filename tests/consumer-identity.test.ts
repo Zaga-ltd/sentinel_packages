@@ -117,6 +117,24 @@ describe("the plugin resolves both shapes", () => {
     }
   });
 
+  test("with no resolver answer, the browser's guest id is the consumer", async () => {
+    const consumers = await runWith(() => null, {
+      "x-sentrinel-consumer": "guest:anon_abcdef123456",
+      "x-sentrinel-device": "anon_abcdef123456",
+    });
+    expect(consumers.map((c) => c.identifier)).toEqual(["guest:anon_abcdef123456"]);
+  });
+
+  test("the app's own resolver always beats the header", async () => {
+    const consumers = await runWith(() => "usr_real", { "x-sentrinel-consumer": "guest:anon_abcdef123456" });
+    expect(consumers.map((c) => c.identifier)).toEqual(["usr_real"]);
+  });
+
+  test("a claimed non-guest consumer is not trusted", async () => {
+    const consumers = await runWith(undefined, { "x-sentrinel-consumer": "usr_admin" });
+    expect(consumers).toHaveLength(0);
+  });
+
   test("a resolver that throws leaves the request anonymous, not broken", async () => {
     const consumers = await runWith(() => {
       throw new Error("resolver blew up");

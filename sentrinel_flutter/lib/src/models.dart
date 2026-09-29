@@ -339,52 +339,82 @@ class EventRecord {
       };
 }
 
-/// Collapse the ids out of a URL path so it groups as one endpoint.
+/// The route identity for a path — the ids collapsed out, the words kept.
 ///
-/// A mobile app calls `/orders/8f3a…` and `/orders/9b21…`; the server keys
-/// endpoints on `route || path`, so without this each id becomes an endpoint
-/// of its own — an unbounded endpoints table, and an "active endpoints" count
-/// in the hundreds for an app that calls thirty routes.
+/// A port of the API's `normaliseRoutePath` (apps/api/src/lib/route-path.ts),
+/// rule for rule. It has to be the same function, not a similar one: the
+/// server normalises every path it groups by, and a client that collapsed ids
+/// differently — `{id}` where the server writes `{uuid}`, a 12-character hex
+/// run the server leaves alone — sent rollup rows the server then re-keyed into
+/// a *different* spelling, so one route showed up as several endpoint rows.
+/// `test/route_path_test.dart` runs the server's own cases through this.
 ///
-/// The rules are deliberately conservative: a segment is replaced only when it
-/// is *obviously* an identifier. Collapsing `/v1/` into `/{id}/` would be far
-/// worse than leaving a stray id in place, because it merges endpoints that
-/// have nothing to do with each other.
-String routeTemplate(String path) {
-  if (path.isEmpty) return '/';
+/// Conservative on purpose. Collapsing `call-histories` into `{id}` would merge
+/// endpoints that have nothing to do with each other, which cannot be undone;
+/// leaving a stray id in place only costs a row.
+String normaliseRoutePath(String? path) {
+  if (path == null || path.isEmpty) return '';
+  // Query strings and fragments are not part of a route identity, and a query
+  // string is unbounded cardinality on its own.
+  final clean = path.split('?').first.split('#').first;
+  if (!clean.contains('/')) return _normaliseSegment(clean);
+  return clean.split('/').map((s) => s.isEmpty ? s : _normaliseSegment(s)).join('/');
+}
 
-  final segments = path.split('/');
-  for (var i = 0; i < segments.length; i++) {
-    final seg = segments[i];
-    if (seg.isEmpty) continue;
-    if (_looksLikeId(seg)) segments[i] = '{id}';
-  }
-  final out = segments.join('/');
-  return out.isEmpty ? '/' : out;
+/// The old name. Kept so code written against 0.2 still compiles; it now
+/// returns exactly what the server stores, and `/` for an empty path because a
+/// request always has one.
+@Deprecated('Use normaliseRoutePath')
+String routeTemplate(String path) {
+  final route = normaliseRoutePath(path);
+  return route.isEmpty ? '/' : route;
 }
 
 final _uuid = RegExp(
     r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$');
-final _digits = RegExp(r'^\d+$');
-// 8+ is where short SHAs and compact ids live. Shorter than that and the false
-// positives start costing more than the collapsing saves.
-final _hex = RegExp(r'^[0-9a-fA-F]{8,}$');
-// Mixed-case alphanumerics of some length: ULIDs, nanoids, Stripe-style ids.
-final _opaque = RegExp(r'^[A-Za-z0-9_-]{16,}$');
-final _hasDigit = RegExp(r'\d');
+final _numeric = RegExp(r'^\d+$');
+final _hexRun = RegExp(r'^[0-9a-fA-F]{16,}$');
+final _date = RegExp(r'^\d{4}-\d{2}(-\d{2})?$');
+final _prefixed = RegExp(r'^([A-Za-z][A-Za-z_]*)-(.+)$');
+final _filename = RegExp(r'^(.+)\.([A-Za-z0-9]{1,5})$');
+final _idChars = RegExp(r'^[A-Za-z0-9_-]+$');
+final _alnum = RegExp(r'^[A-Za-z0-9]+$');
+final _digit = RegExp(r'\d');
+final _lower = RegExp(r'[a-z]');
+final _upper = RegExp(r'[A-Z]');
 
-bool _looksLikeId(String seg) {
-  if (_uuid.hasMatch(seg)) return true;
-  if (_digits.hasMatch(seg)) return true;
+/// An identifier carries entropy a word does not — a digit, or a change of
+/// case mid-token. Length alone cannot tell `merchant-8f5v2Q2SkT` from
+/// `call-histories`.
+bool _looksLikeId(String s) {
+  if (s.length < 8) return false;
+  if (!_idChars.hasMatch(s)) return false;
+  final hasDigit = _digit.hasMatch(s);
+  final mixedCase = _lower.hasMatch(s) && _upper.hasMatch(s);
+  return hasDigit || mixedCase;
+}
 
-  // Every remaining rule insists on a digit, and that is what keeps ordinary
-  // words safe. `facade`, `decade` and `defaced` are all valid hex; `orders`
-  // and `notifications` are long enough to look opaque. Merging any of those
-  // into `{id}` would fuse unrelated endpoints — far worse than leaving one
-  // stray id uncollapsed.
-  if (!_hasDigit.hasMatch(seg)) return false;
+String _normaliseSegment(String segment) {
+  if (_uuid.hasMatch(segment)) return '{uuid}';
+  if (_numeric.hasMatch(segment)) return '{id}';
+  if (_hexRun.hasMatch(segment)) return '{hash}';
+  if (_date.hasMatch(segment)) return '{date}';
 
-  if (_hex.hasMatch(seg)) return true;
-  if (_opaque.hasMatch(seg)) return true;
-  return false;
+  final prefixed = _prefixed.firstMatch(segment);
+  if (prefixed != null && _looksLikeId(prefixed.group(2)!)) return '{id}';
+
+  // A bare opaque token. Stricter than the prefixed case because nothing
+  // vouches for this being an id position.
+  if (segment.length >= 10 && _alnum.hasMatch(segment) && _looksLikeId(segment)) {
+    return '{id}';
+  }
+
+  // `<uuid>.jpg` keeps its extension: it is the useful part of a static-asset
+  // route, and losing it would merge images with documents.
+  final file = _filename.firstMatch(segment);
+  if (file != null) {
+    final stem = _normaliseSegment(file.group(1)!);
+    if (stem != file.group(1)) return '$stem.${file.group(2)}';
+  }
+  return segment;
 }

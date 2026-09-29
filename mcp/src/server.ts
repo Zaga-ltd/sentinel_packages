@@ -24,6 +24,7 @@ import { z } from "zod";
 
 import { configFromEnv, SentrinelClient } from "./client";
 import { autoUpdate } from "./update";
+import { VERSION } from "./version";
 import {
   issuesToMarkdown,
   issueToMarkdown,
@@ -58,7 +59,9 @@ const ISSUE_SORT = z
   );
 
 export function buildServer(client: SentrinelClient): McpServer {
-  const server = new McpServer({ name: "sentrinel", version: "0.1.0" });
+  // The real version, so an agent's server list and a bug report say which
+  // build is running — a hard-coded 0.1.0 said the same thing for every one.
+  const server = new McpServer({ name: "sentrinel", version: VERSION });
 
   server.registerTool(
     "list_issues",
@@ -286,15 +289,18 @@ if (import.meta.main) {
     console.error(`sentrinel-mcp: ${err instanceof Error ? err.message : err}`);
     process.exit(1);
   }
-  // Before the transport connects, so a replaced bundle is in place for the
-  // next spawn. Never on stdout — one stray byte there corrupts the protocol
-  // stream and the agent reports the server as broken.
-  try {
-    const note = await autoUpdate();
-    if (note) console.error(note);
-  } catch {
-    /* an update check must never stop the server starting */
-  }
-
   await buildServer(client).connect(new StdioServerTransport());
+
+  // After the transport connects, not before: a check and a download could
+  // hold the handshake for tens of seconds, and an agent that times out a
+  // server's start reports it as broken. A replaced bundle is picked up on the
+  // next spawn either way. Never on stdout — one stray byte there corrupts
+  // the protocol stream.
+  autoUpdate()
+    .then((note) => {
+      if (note) console.error(note);
+    })
+    .catch(() => {
+      /* an update check must never disturb the server */
+    });
 }

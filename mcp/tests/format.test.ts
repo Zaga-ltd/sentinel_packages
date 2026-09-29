@@ -2,7 +2,15 @@
 // call, and none may throw on a field the API stopped sending.
 
 import { describe, expect, test } from "bun:test";
-import { ago, issuesToMarkdown, issueToMarkdown, logsToMarkdown, traceToMarkdown, requestToMarkdown } from "../src/format";
+import {
+  ago,
+  issuesToMarkdown,
+  issueToMarkdown,
+  logsToMarkdown,
+  traceToMarkdown,
+  requestToMarkdown,
+  slowQueriesToMarkdown,
+} from "../src/format";
 
 describe("issues", () => {
   test("empty is a sentence, not a blank", () => {
@@ -90,6 +98,44 @@ describe("trace", () => {
     expect(md).toContain("  - db.query — 800ms **[error]**");
     expect(md).toContain("timeout");
     expect(md).toContain("- orphan"); // a missing parent does not lose the span
+  });
+
+  test("reads a span's outcome in the shape the API sends it", () => {
+    // statusCode is OpenTelemetry's "OK" / "ERROR" string and the reason is
+    // statusMessage. A numeric comparison never matched a single span.
+    const md = traceToMarkdown({
+      trace: { traceId: "t2", name: "GET /x" },
+      spans: [
+        { spanId: "a", name: "handler", durationMs: 50, statusCode: "OK", statusMessage: null },
+        { spanId: "b", parentSpanId: "a", name: "http.client", durationMs: 40, statusCode: "ERROR", statusMessage: "ECONNRESET" },
+      ],
+    });
+    expect(md).toContain("- handler — 50ms\n");
+    expect(md).toContain("  - http.client — 40ms **[error]**");
+    expect(md).toContain("ECONNRESET");
+  });
+});
+
+describe("slow queries", () => {
+  test("callers are the roles that ran the query, with their call counts", () => {
+    const md = slowQueriesToMarkdown({
+      queries: [
+        {
+          queryid: "42",
+          queryText: "SELECT 1",
+          calls: 10,
+          totalExecMs: 100,
+          callers: [
+            { usename: "app", calls: 1234 },
+            { usename: "reporting", calls: 7 },
+          ],
+          callerCount: 3,
+        },
+      ],
+    });
+    expect(md).toContain("run by: app (1,234 calls), reporting (7 calls) and 1 more");
+    expect(md).not.toContain("called from");
+    expect(md).not.toContain('{"usename"');
   });
 });
 

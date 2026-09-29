@@ -110,14 +110,35 @@ export function instrumentConsole(options: LogCaptureOptions) {
   }
 }
 
+/** One request's captured console lines, held by reference. */
+export type RequestLogContextHandle = RequestLogContext;
+
 /** Called from the plugin's derive hook: opens this request's log context. */
-export function beginRequestLogContext(requestId: string) {
-  storage.enterWith({ requestId, buffer: [], dropped: 0 });
+export function beginRequestLogContext(requestId: string): RequestLogContextHandle {
+  const ctx: RequestLogContext = { requestId, buffer: [], dropped: 0 };
+  storage.enterWith(ctx);
+  return ctx;
+}
+
+/** A context not yet entered — pair with runWithRequestLogContext(). */
+export function createRequestLogContext(requestId: string): RequestLogContextHandle {
+  return { requestId, buffer: [], dropped: 0 };
+}
+
+/** Enter an existing context for the rest of this async execution. */
+export function enterRequestLogContext(ctx: RequestLogContextHandle): void {
+  storage.enterWith(ctx);
+}
+
+export function runWithRequestLogContext<T>(ctx: RequestLogContextHandle, fn: () => T): T {
+  return storage.run(ctx, fn);
 }
 
 /** Called from afterResponse: drains and returns this request's lines. */
-export function drainRequestLogs(): { logs: CapturedLog[]; dropped: number } {
-  const ctx = storage.getStore();
+export function drainRequestLogs(ctx: RequestLogContextHandle | undefined = storage.getStore()): {
+  logs: CapturedLog[];
+  dropped: number;
+} {
   if (!ctx) return { logs: [], dropped: 0 };
   const logs = ctx.buffer;
   const dropped = ctx.dropped;

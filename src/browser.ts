@@ -19,13 +19,16 @@
  *
  * Same-origin fetches get a `traceparent` header, so the backend plugin
  * continues the trace rather than starting a new one: a click and the server
- * work it caused land on one timeline. That is the part worth having.
+ * work it caused land on one timeline. That is the part worth having. They
+ * also carry `x-sentrinel-consumer` and `x-sentrinel-device`, so the backend
+ * can attribute a signed-out visitor's requests to the same `guest:` id the
+ * page uses.
  *
  * ```ts
  * import { initSentrinelBrowser } from "@sentrinel/plugin/browser";
  *
  * const sentrinel = initSentrinelBrowser({ release: "2026.8.2" });
- * sentrinel.setUser("user_123");
+ * sentrinel.identify("user_123");
  * sentrinel.addBreadcrumb("checkout opened", { category: "ui" });
  * ```
  */
@@ -33,16 +36,28 @@
 // ─── Types ──────────────────────────────────────────────────────────────────
 
 import { startReplay, type ReplayController, type ReplayOptions, type ReplayUpload } from "./replay";
+import { maskQueryParams, maskUrl } from "./masking";
 
 export type { ReplayOptions } from "./replay";
 
 export interface SentrinelBrowserOptions {
   /**
-   * Where batches are posted. Same-origin by default, which is what keeps the
-   * ingest key on your server. Point it at the ingest API directly only if you
-   * accept that the key in `headers` becomes public.
+   * Where batches are posted. `/api/sentrinel` — same-origin — by default,
+   * which is what keeps the ingest key on your server. Point it at the ingest
+   * API directly only if you accept that the key in `headers` becomes public.
+   *
+   * Not `/api/_sentrinel`, the old default: Next's App Router treats a folder
+   * starting with `_` as private and never routes to it, so the default could
+   * not be served by the framework it was most often used with.
    */
   endpoint?: string;
+  /**
+   * Extra query keys to mask in every URL the SDK records. Added to a
+   * built-in list that always applies — reset and magic-link tokens, OAuth
+   * `code`, `api_key`, signed-URL signatures — because a page URL is exactly
+   * where those turn up.
+   */
+  maskQueryParams?: (string | RegExp)[];
   /** Build identifier. Without it, release health cannot tell builds apart. */
   release?: string;
   /**
@@ -180,8 +195,22 @@ export interface SentrinelBrowser {
   captureError(error: unknown, context?: Record<string, unknown>): void;
   /** Leave a note on the trail that every later error carries. */
   addBreadcrumb(message: string, options?: Omit<Breadcrumb, "timestamp" | "message">): void;
-  /** Who this is, so errors group by person on the Consumers page. */
+  /**
+   * Who this is, so errors group by person on the Consumers page. Until it is
+   * called — and after `null` — records are attributed to `guest:<device id>`.
+   */
   setUser(id: string | null | undefined): void;
+  /**
+   * Switch attribution to this user, and link this device's guest history to
+   * them. `identify(null)` goes back to the guest id. Same as `setUser`.
+   */
+  identify(id: string | null | undefined): void;
+  /** Sign-out: back to the guest id. The device id itself is kept. */
+  reset(): void;
+  /** Who records are attributed to right now: the user, or `guest:<device id>`. */
+  readonly consumer: string;
+  /** This browser's persisted anonymous id. */
+  readonly deviceId: string;
   /** Key/values attached to everything sent from here on. */
   setContext(context: Record<string, unknown>): void;
   /**
@@ -234,6 +263,42 @@ const MAX_MESSAGE_CHARS = 2_000;
 /** Errors have no HTTP method. `varchar(10)`, so this has to stay short. */
 const BROWSER_METHOD = "BROWSER";
 
+/** The default tunnel path. See `endpoint` for why not `/api/_sentrinel`. */
+export const DEFAULT_ENDPOINT = "/api/sentrinel";
+
+// ─── Delivery ────────────────────────────────────────────────────────────────
+//
+// A batch used to be taken out of the buffers — and the session marked sent —
+// before the POST, and a failed POST only logged a warning. A server restart,
+// a flaky mobile connection or a deploy of the tunnel's host lost the batch
+// outright, and a session whose final state failed to send stayed "ok"
+// forever. Batches now wait in an outbox until the tunnel answers 2xx, with
+// backoff, within these bounds.
+
+/** Batches held while delivery is failing; past this the oldest are dropped. */
+const MAX_OUTBOX = 50;
+/** …and serialized bytes. */
+const MAX_OUTBOX_BYTES = 1024 * 1024;
+/** Attempts per batch before it is abandoned. */
+const MAX_SEND_ATTEMPTS = 8;
+/**
+ * Largest body `sendBeacon` and `keepalive` will carry — the spec's 64KB
+ * in-flight budget, less headroom. Batches are split to fit, so the ones
+ * still waiting when the page is hidden can all leave.
+ */
+const UNLOAD_BODY_LIMIT = 60_000;
+
+type SendResult = "ok" | "retry" | "drop";
+
+interface PendingBatch {
+  payload: BatchPayload;
+  bytes: number;
+  attempts: number;
+  nextAt: number;
+  /** Being sent right now — the pump must not send it twice. */
+  inflight: boolean;
+}
+
 // ─── Init ───────────────────────────────────────────────────────────────────
 
 let active: SentrinelBrowser | null = null;
@@ -242,6 +307,10 @@ const NOOP: SentrinelBrowser = {
   captureError() {},
   addBreadcrumb() {},
   setUser() {},
+  identify() {},
+  reset() {},
+  consumer: "",
+  deviceId: "",
   setContext() {},
   track() {},
   page() {},
@@ -353,10 +422,15 @@ class BrowserClient implements SentrinelBrowser {
   private replay: ReplayController | null = null;
   private closed = false;
   private warned = new Set<string>();
+  /** Batches not yet acknowledged by the tunnel. */
+  private outbox: PendingBatch[] = [];
+  private pumping: Promise<void> | null = null;
+  /** Batches abandoned since the last report, so a drop is never silent. */
+  private droppedBatches = 0;
 
   constructor(options: SentrinelBrowserOptions) {
     this.opts = {
-      endpoint: "/api/_sentrinel",
+      endpoint: DEFAULT_ENDPOINT,
       flushInterval: 10_000,
       maxBatch: 100,
       captureRequests: true,
@@ -405,9 +479,35 @@ class BrowserClient implements SentrinelBrowser {
     }
   }
 
+  /**
+   * Who records are attributed to: the identified user, or this device as a
+   * guest.
+   *
+   * Signed-out traffic used to be attributed to nobody (`null`), so a visitor
+   * who hit an error before logging in was invisible on the Consumers page
+   * and could not be followed across their visits. A `guest:` id names the
+   * device rather than a person — the same id the backend receives on
+   * `x-sentrinel-consumer`, so both halves attribute to one consumer.
+   */
+  get consumer(): string {
+    return this.userId ?? `guest:${this.anonymousId}`;
+  }
+
+  get deviceId(): string {
+    return this.anonymousId;
+  }
+
+  identify(id: string | null | undefined): void {
+    this.setUser(id);
+  }
+
+  reset(): void {
+    this.setUser(null);
+  }
+
   setUser(id: string | null | undefined): void {
     const previous = this.userId;
-    this.userId = id ?? undefined;
+    this.userId = id ? String(id) : undefined;
     if (this.session) this.session.userId = this.userId;
 
     // Tell the server this device belongs to this person, so everything the
@@ -448,9 +548,11 @@ class BrowserClient implements SentrinelBrowser {
   }
 
   page(name?: string, properties?: Record<string, unknown>): void {
+    // The search string is where reset tokens and OAuth codes live, and a
+    // pageview is stored as-is and shown in lists — masked before it leaves.
     const path =
       name ??
-      (typeof location !== "undefined" ? location.pathname + location.search : "");
+      (typeof location !== "undefined" ? this.mask(location.pathname + location.search) : "");
     if (!path) return;
 
     // Time on the page just left, measured before the marker is replaced.
@@ -466,7 +568,7 @@ class BrowserClient implements SentrinelBrowser {
       userId: this.userId,
       sessionId: this.session?.sessionId,
       properties,
-      referrer: this.lastPath || (typeof document !== "undefined" ? document.referrer : ""),
+      referrer: this.lastPath || (typeof document !== "undefined" ? this.mask(document.referrer ?? "") : ""),
       durationMs: duration > 0 && duration < 3_600_000 ? duration : 0,
     });
     this.lastPath = path;
@@ -480,8 +582,8 @@ class BrowserClient implements SentrinelBrowser {
 
   async flush(): Promise<void> {
     const payload = this.drain();
-    if (!payload) return;
-    await this.send(payload, false);
+    if (payload) this.enqueue(payload);
+    await this.pump();
   }
 
   async close(): Promise<void> {
@@ -490,7 +592,11 @@ class BrowserClient implements SentrinelBrowser {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this.endSession("ok");
-    for (const undo of this.teardown.splice(0)) {
+    // Newest first. Two installers wrap history.pushState in turn, each saving
+    // the function it found; undoing them oldest-first restored the original
+    // and then put the second wrapper — which still calls the first — back on
+    // top, leaving history patched after close().
+    for (const undo of this.teardown.splice(0).reverse()) {
       try {
         undo();
       } catch {
@@ -510,8 +616,13 @@ class BrowserClient implements SentrinelBrowser {
       release: this.opts.release,
       startedAt: new Date().toISOString(),
       userId: this.userId,
-      attributes: { platform: "browser", ...deviceContext() },
+      attributes: { platform: "browser", "device.id": this.anonymousId, ...deviceContext() },
     };
+  }
+
+  /** A URL with its credential-bearing query values masked. */
+  private mask(url: string): string {
+    return maskUrl(url, this.opts.maskQueryParams);
   }
 
   /**
@@ -667,15 +778,16 @@ class BrowserClient implements SentrinelBrowser {
       errorType: type,
       errorMessage: truncate(message, MAX_MESSAGE_CHARS),
       stackTrace: stack ? truncate(stack, MAX_STACK_CHARS) : undefined,
-      consumerIdentifier: this.userId ?? null,
+      consumerIdentifier: this.consumer,
       timestamp: new Date().toISOString(),
       attributes: {
         ...this.context,
         ...meta.context,
         "error.handled": meta.handled,
         "error.mechanism": meta.mechanism ?? (meta.handled ? "captureError" : "onerror"),
-        "browser.url": currentUrl(),
-        ...(meta.source ? { "error.source": meta.source } : {}),
+        "browser.url": this.mask(currentUrl()),
+        "device.id": this.anonymousId,
+        ...(meta.source ? { "error.source": this.mask(meta.source) } : {}),
         ...(meta.line != null ? { "error.line": meta.line } : {}),
         ...(meta.column != null ? { "error.column": meta.column } : {}),
         ...(this.session ? { "session.id": this.session.sessionId } : {}),
@@ -743,6 +855,11 @@ class BrowserClient implements SentrinelBrowser {
           merged.set("traceparent", `00-${traceId}-${spanId}-01`);
           propagated = true;
         }
+        // Who is calling, for a backend that cannot tell on its own — a
+        // signed-out visitor has no session to resolve. Only ever sent where
+        // traceparent is: your own origins, never a third party.
+        setHeaderSafely(merged, "x-sentrinel-consumer", this.consumer);
+        setHeaderSafely(merged, "x-sentrinel-device", this.anonymousId);
         headers = merged;
         init = { ...init, headers };
       }
@@ -787,6 +904,16 @@ class BrowserClient implements SentrinelBrowser {
     }
   }
 
+  /** Same origin as the page, or a target the app said it owns. */
+  private isFirstParty(url: string): boolean {
+    try {
+      if (new URL(url, location.href).origin === location.origin) return true;
+    } catch {
+      // Unparseable: fall through to the configured targets.
+    }
+    return this.shouldPropagate(url);
+  }
+
   private shouldPropagate(url: string): boolean {
     return this.traceTargets.some((t) => (typeof t === "string" ? url.includes(t) : t.test(url)));
   }
@@ -816,6 +943,8 @@ class BrowserClient implements SentrinelBrowser {
     if (!keep) return;
 
     const id = randomId(32);
+    const query = queryOf(args.url);
+    const firstParty = this.isFirstParty(args.url);
     const record: BrowserRequest = {
       id,
       method: args.method,
@@ -824,8 +953,8 @@ class BrowserClient implements SentrinelBrowser {
       responseTime: Math.round(ms * 100) / 100,
       requestSize: 0,
       responseSize: 0,
-      consumerIdentifier: this.userId ?? null,
-      queryParams: queryOf(args.url),
+      consumerIdentifier: this.consumer,
+      queryParams: query ? maskQueryParams(query, this.opts.maskQueryParams) : undefined,
       errorMessage: args.error,
       traceId: args.traceId,
       spanId: args.spanId,
@@ -833,8 +962,15 @@ class BrowserClient implements SentrinelBrowser {
       sampleRate: failed || slow ? 1 : this.opts.sampleRate,
       attributes: {
         ...this.context,
-        "browser.url": currentUrl(),
-        "http.url": args.url,
+        // A timing measured in the browser, not by the server that answered:
+        // it includes the network, and must never be averaged into the
+        // backend's own numbers for the same route.
+        "sentrinel.kind": "client",
+        "http.host": hostOf(args.url),
+        ...(firstParty ? {} : { "sentrinel.third_party": true }),
+        "browser.url": this.mask(currentUrl()),
+        "http.url": this.mask(args.url),
+        "device.id": this.anonymousId,
         ...(this.session ? { "session.id": this.session.sessionId } : {}),
         ...(this.opts.release ? { release: this.opts.release } : {}),
       },
@@ -853,12 +989,17 @@ class BrowserClient implements SentrinelBrowser {
         statusMessage: args.error,
         errorType: "NetworkError",
         errorMessage: truncate(args.error, MAX_MESSAGE_CHARS),
-        consumerIdentifier: this.userId ?? null,
+        consumerIdentifier: this.consumer,
         timestamp: new Date().toISOString(),
         traceId: args.traceId,
         // What lets an issue open the exact request that produced it.
         requestLogId: id,
-        attributes: { ...this.context, "browser.url": currentUrl() },
+        attributes: {
+          ...this.context,
+          "browser.url": this.mask(currentUrl()),
+          "http.url": this.mask(args.url),
+          "device.id": this.anonymousId,
+        },
       });
       this.markSession("errored");
     }
@@ -918,18 +1059,19 @@ class BrowserClient implements SentrinelBrowser {
       if (document.visibilityState === "hidden" || !this.session?.endedAt) {
         this.endSession("ok");
       }
-      const payload = this.drain();
-      if (payload) void this.send(payload, true);
+      this.flushForUnload();
       // Anything the recorder is still holding. Best-effort: a chunk can be
       // megabytes, which is far past what a beacon will carry, so a recording
       // that only fails at the very last moment may not survive the unload.
       this.replay?.flush();
     };
-    window.addEventListener("pagehide", onHide);
-    document.addEventListener("visibilitychange", () => {
+    const onVisibility = () => {
       if (document.visibilityState === "hidden") onHide();
-    });
+    };
+    window.addEventListener("pagehide", onHide);
+    document.addEventListener("visibilitychange", onVisibility);
     this.teardown.push(() => window.removeEventListener("pagehide", onHide));
+    this.teardown.push(() => document.removeEventListener("visibilitychange", onVisibility));
   }
 
   // ── Sending ───────────────────────────────────────────────────────────────
@@ -949,7 +1091,8 @@ class BrowserClient implements SentrinelBrowser {
     this.page();
 
     const emit = () => {
-      const path = location.pathname + location.search;
+      // Compared in the same (masked) form page() stores it in.
+      const path = this.mask(location.pathname + location.search);
       // A router that re-renders the same route must not count twice.
       if (path === this.lastPath) return;
       this.page();
@@ -1002,47 +1145,170 @@ class BrowserClient implements SentrinelBrowser {
       sessionId: this.session?.sessionId,
       sessions: sendSession ? [{ ...this.session!, vitals: { ...this.vitals } }] : [],
     };
+    // Optimistic: set back to false if delivery of this batch fails (see
+    // settle()), so the latest session state rides the next batch.
     if (sendSession) this.sessionSent = true;
     return payload;
   }
 
-  private async send(payload: BatchPayload, beacon: boolean): Promise<void> {
-    const body = JSON.stringify(payload);
-    const url = this.opts.endpoint;
+  /** Hold a batch until it is acknowledged, split to fit an unload transport. */
+  private enqueue(payload: BatchPayload): void {
+    for (const part of splitBatch(payload)) {
+      const bytes = safeStringify(part).length;
+      this.outbox.push({ payload: part, bytes, attempts: 0, nextAt: 0, inflight: false });
+    }
+    // Oldest out: in an outage the recent records are the ones worth keeping.
+    let total = this.outbox.reduce((n, p) => n + p.bytes, 0);
+    while (this.outbox.length > 1 && (this.outbox.length > MAX_OUTBOX || total > MAX_OUTBOX_BYTES)) {
+      const i = this.outbox.findIndex((p) => !p.inflight);
+      if (i < 0) break;
+      const [dropped] = this.outbox.splice(i, 1);
+      total -= dropped.bytes;
+      this.droppedBatches++;
+    }
+    if (this.droppedBatches) {
+      this.warnOnce(
+        "outbox",
+        `telemetry could not be delivered to ${this.opts.endpoint} and the backlog is full — ` +
+          `dropping the oldest batches.`
+      );
+    }
+  }
 
-    // sendBeacon is the only transport a browser guarantees to complete once
-    // the page is going away. It has no headers, so it is used only when a
-    // tunnel makes them unnecessary.
-    if (beacon && !this.opts.headers && typeof navigator !== "undefined" && navigator.sendBeacon) {
+  /**
+   * Send what is due, one batch at a time, stopping at the first failure so a
+   * dead endpoint is not hammered. Concurrent callers share one run.
+   */
+  private pump(): Promise<void> {
+    if (this.pumping) return this.pumping;
+    this.pumping = (async () => {
       try {
-        if (navigator.sendBeacon(url, new Blob([body], { type: "application/json" }))) return;
-      } catch {
-        // Fall through to fetch — a rejected beacon is better retried than lost.
+        while (true) {
+          const now = Date.now();
+          const next = this.outbox.find((p) => !p.inflight && p.nextAt <= now);
+          if (!next) break;
+          next.inflight = true;
+          const result = await this.post(next.payload, next.bytes, false);
+          next.inflight = false;
+          if (!this.settle(next, result)) break;
+        }
+      } finally {
+        this.pumping = null;
       }
+    })();
+    return this.pumping;
+  }
+
+  /**
+   * Apply a send result to a pending batch. Returns false when delivery is
+   * failing and the caller should stop for now.
+   */
+  private settle(pending: PendingBatch, result: SendResult): boolean {
+    const remove = () => {
+      const i = this.outbox.indexOf(pending);
+      if (i >= 0) this.outbox.splice(i, 1);
+    };
+    if (result === "ok") {
+      remove();
+      return true;
+    }
+    if (result === "drop") {
+      remove();
+      this.droppedBatches++;
+      return true;
     }
 
+    // Retry, later. A session snapshot is taken out of the held batch and
+    // re-armed instead: by the time this batch lands, a newer state (a crash,
+    // an end time, final vitals) may exist, and an old snapshot delivered late
+    // would overwrite it.
+    if (pending.payload.sessions?.length) {
+      pending.payload = { ...pending.payload, sessions: [] };
+      if (this.session) this.sessionSent = false;
+    }
+    pending.attempts++;
+    const empty =
+      !pending.payload.errors.length && !pending.payload.requests.length && !(pending.payload.events?.length ?? 0);
+    if (empty) {
+      remove();
+    } else if (pending.attempts >= MAX_SEND_ATTEMPTS) {
+      remove();
+      this.droppedBatches++;
+    } else {
+      // 2s, 4s, 8s… capped at a minute, jittered so a fleet of tabs that lost
+      // the same server does not come back in lockstep.
+      const backoff = Math.min(60_000, 2_000 * 2 ** (pending.attempts - 1));
+      pending.nextAt = Date.now() + backoff * (0.5 + Math.random() * 0.5);
+    }
+    return false;
+  }
+
+  /**
+   * The page is going away (or hidden, which on mobile is often the last
+   * chance): hand every waiting batch to a transport that outlives the page.
+   */
+  private flushForUnload(): void {
+    const payload = this.drain();
+    if (payload) this.enqueue(payload);
+    for (const pending of [...this.outbox]) {
+      if (pending.inflight) continue;
+      // sendBeacon is the only transport a browser guarantees to complete once
+      // the page is going away. It has no headers, so it is used only when a
+      // tunnel makes them unnecessary. `true` means queued, not delivered —
+      // the best a page can know at this point.
+      if (this.canBeacon() && pending.bytes <= UNLOAD_BODY_LIMIT) {
+        try {
+          const body = safeStringify(pending.payload);
+          if (navigator.sendBeacon(this.opts.endpoint, new Blob([body], { type: "application/json" }))) {
+            this.settle(pending, "ok");
+            continue;
+          }
+        } catch {
+          // Fall through to a keepalive fetch.
+        }
+      }
+      pending.inflight = true;
+      void this.post(pending.payload, pending.bytes, true).then((result) => {
+        pending.inflight = false;
+        this.settle(pending, result);
+      });
+    }
+  }
+
+  private canBeacon(): boolean {
+    return !this.opts.headers && typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function";
+  }
+
+  private async post(payload: BatchPayload, bytes: number, unloading: boolean): Promise<SendResult> {
+    const url = this.opts.endpoint;
     const send = this.originalFetch ?? fetch;
     try {
       const res = await send(url, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...(this.opts.headers ?? {}) },
-        body,
-        // Survives the page navigating away mid-request.
-        keepalive: body.length < 60_000,
+        body: safeStringify(payload),
+        // Survives the page navigating away mid-request — within the
+        // browser's 64KB budget for such requests.
+        keepalive: bytes <= UNLOAD_BODY_LIMIT,
         credentials: "same-origin",
       });
-      if (!res.ok) {
-        this.warnOnce(
-          String(res.status),
-          `telemetry rejected (${res.status}). Check that ${url} is reachable and that ` +
-            `the tunnel's apiKey and env match.`
-        );
-        return;
+      if (res.ok) {
+        this.warned.delete("connect");
+        this.warned.delete(String(res.status));
+        this.log("sent", payload.errors.length, "errors,", payload.requests.length, "requests");
+        return "ok";
       }
-      this.warned.clear();
-      this.log("sent", payload.errors.length, "errors,", payload.requests.length, "requests");
+      this.warnOnce(
+        String(res.status),
+        `telemetry rejected (${res.status}). Check that ${url} is reachable and that ` +
+          `the tunnel's apiKey and env match.`
+      );
+      // 408/429/5xx can succeed later; any other 4xx is a request that will
+      // be refused the same way every time.
+      return res.status === 408 || res.status === 429 || res.status >= 500 ? "retry" : "drop";
     } catch (err) {
-      this.warnOnce("connect", `cannot reach ${url} — ${(err as Error)?.message ?? err}`);
+      if (!unloading) this.warnOnce("connect", `cannot reach ${url} — ${(err as Error)?.message ?? err}`);
+      return "retry";
     }
   }
 
@@ -1060,7 +1326,7 @@ class BrowserClient implements SentrinelBrowser {
         { debug: this.opts.debug, ...this.opts.replay },
         (upload) => void this.sendReplay(upload),
         () => this.session?.sessionId,
-        () => this.userId
+        () => this.consumer
       );
       if (this.replay) this.teardown.push(() => this.replay?.stop());
     } catch (err) {
@@ -1079,7 +1345,17 @@ class BrowserClient implements SentrinelBrowser {
    */
   private async sendReplay(upload: ReplayUpload): Promise<void> {
     const send = this.originalFetch ?? fetch;
-    const body = JSON.stringify({ replay: upload, release: this.opts.release });
+    // The page URL rides on the chunk and inside rrweb's Meta event — both
+    // masked, like every other URL this SDK sends.
+    const masked: ReplayUpload = {
+      ...upload,
+      url: upload.url ? this.mask(upload.url) : upload.url,
+      events: upload.events.map((e) => {
+        const data = e.data as { href?: unknown } | undefined;
+        return typeof data?.href === "string" ? { ...e, data: { ...data, href: this.mask(data.href) } } : e;
+      }),
+    };
+    const body = JSON.stringify({ replay: masked, release: this.opts.release });
     try {
       const res = await send(this.opts.endpoint, {
         method: "POST",
@@ -1190,6 +1466,53 @@ function safeStringify(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+/**
+ * Set a header unless the caller already did — and never let it break the
+ * app's request. `Headers.set` throws on a value outside ISO-8859-1 (a user id
+ * with an accent, say), and a monitoring header must not turn into a failed
+ * fetch.
+ */
+function setHeaderSafely(headers: Headers, name: string, value: string | undefined): void {
+  if (!value || headers.has(name)) return;
+  if (value.length > 255 || !/^[\x20-\x7e]+$/.test(value)) return;
+  try {
+    headers.set(name, value);
+  } catch {
+    // Unsendable value: leave the header off.
+  }
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url, typeof location !== "undefined" ? location.href : "http://localhost").host;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Split a batch into parts small enough for `sendBeacon`/`keepalive`, by
+ * halving its record lists. Sessions and identity ride the first part only
+ * (identity on all). A single oversized record is left whole — it can still
+ * go by an ordinary fetch while the page is alive.
+ */
+function splitBatch(payload: BatchPayload): BatchPayload[] {
+  if (safeStringify(payload).length <= UNLOAD_BODY_LIMIT) return [payload];
+  const events = payload.events ?? [];
+  const count = payload.errors.length + payload.requests.length + events.length;
+  if (count <= 1) return [payload];
+  const half = <T>(list: T[]): [T[], T[]] => {
+    const mid = Math.ceil(list.length / 2);
+    return [list.slice(0, mid), list.slice(mid)];
+  };
+  const [e1, e2] = half(payload.errors);
+  const [r1, r2] = half(payload.requests);
+  const [v1, v2] = half(events);
+  const first: BatchPayload = { ...payload, errors: e1, requests: r1, events: v1 };
+  const second: BatchPayload = { ...payload, errors: e2, requests: r2, events: v2, sessions: [] };
+  return [...splitBatch(first), ...splitBatch(second)];
 }
 
 function describeElement(el: Element): string {

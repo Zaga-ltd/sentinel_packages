@@ -151,6 +151,7 @@ void main() {
       final attrs = (json['record'] as Map)['attributes'] as Map;
       expect(attrs['sentrinel.mechanism'], 'FlutterError.onError');
       expect(attrs['sentrinel.fatal'], isTrue);
+      expect(attrs['device.id'], Sentrinel.deviceId);
     });
 
     test('breadcrumbs explain what led to it', () {
@@ -271,22 +272,200 @@ void main() {
       Sentrinel.captureError(StateError('x'), StackTrace.current, fatal: true);
 
       expect(File('${storage.path}/pending.ndjson').existsSync(), isFalse);
+      expect(File('${storage.path}/session.json').existsSync(), isFalse);
       await Sentrinel.flush();
       expect(captured.rows('/api/ingest/errors', 'errors'), hasLength(1));
     });
 
-    test('guard() reports what escapes to the zone', () async {
+    test('guard() reports what escapes to the zone, without calling it a crash', () async {
+      // An unawaited future's error ends that future, not the app. It used to
+      // be written to the crash spool and held until the next launch — then
+      // counted against the release as a crash that never happened.
       init();
       Sentrinel.guard(() {
         Future<void>.error(StateError('async escape'));
       });
-      // Let the microtask queue deliver the error to the zone handler.
-      await Future<void>.delayed(const Duration(milliseconds: 50));
+      // The zone handler runs, then the error is sent within about a second.
+      await Future<void>.delayed(const Duration(milliseconds: 1300));
+      await Sentrinel.flush();
 
-      final pending = File('${storage.path}/pending.ndjson');
-      expect(pending.existsSync(), isTrue);
-      expect(pending.readAsStringSync(), contains('async escape'));
-      expect(pending.readAsStringSync(), contains('runZonedGuarded'));
+      expect(File('${storage.path}/pending.ndjson').existsSync(), isFalse);
+      final error = captured.rows('/api/ingest/errors', 'errors').single;
+      expect(error['errorMessage'], contains('async escape'));
+      expect(error['attributes']['sentrinel.mechanism'], 'runZonedGuarded');
+      expect(error['attributes']['sentrinel.handled'], isFalse);
+      expect(error['attributes'].containsKey('sentrinel.fatal'), isFalse);
+
+      final statuses = captured.rows('/api/ingest/sessions', 'sessions').map((s) => s['status']);
+      expect(statuses, contains('errored'));
+      expect(statuses, isNot(contains('crashed')));
+    });
+
+    test('a record the spool cannot encode does not close the spool', () {
+      // A cycle in the attributes used to set `unusable`, so every later crash
+      // of the run went unrecorded.
+      init();
+      final cyclic = <String, Object?>{};
+      cyclic['self'] = cyclic;
+      Sentrinel.captureError(StateError('first'), null, fatal: true, attributes: {'c': cyclic});
+      Sentrinel.captureError(StateError('second'), StackTrace.current,
+          fatal: true, attributes: {'at': DateTime.utc(2026)});
+
+      final text = File('${storage.path}/pending.ndjson').readAsStringSync();
+      expect(text, contains('second'));
+      expect(text, contains('2026-01-01T00:00:00.000Z'));
+    });
+
+    test('the spool is bounded and one error is written once per run', () {
+      final spool = CrashSpool(storage.path, maxRecords: 3);
+      expect(spool.append('error', {'n': 1}, fingerprint: 'same'), isNotNull);
+      expect(spool.append('error', {'n': 2}, fingerprint: 'same'), isNull,
+          reason: 'a dying process reporting one error twice writes it once');
+      expect(spool.append('error', {'n': 3}), isNotNull);
+      expect(spool.append('error', {'n': 4}), isNotNull);
+      expect(spool.append('error', {'n': 5}), isNull, reason: 'at the cap');
+      expect(File('${storage.path}/pending.ndjson').readAsLinesSync(), hasLength(3));
+
+      final bytes = CrashSpool('${storage.path}/b', maxBytes: 200);
+      expect(bytes.append('error', {'m': 'x' * 100}), isNotNull);
+      expect(bytes.append('error', {'m': 'x' * 100}), isNull);
+    });
+  });
+
+  group('a crash report leaves the disk only once the server has it', () {
+    test('a fatal error is sent now, and its disk copy goes after the 2xx', () async {
+      init();
+      Sentrinel.captureError(StateError('fatal but alive'), StackTrace.current, fatal: true);
+      expect(File('${storage.path}/pending.ndjson').readAsStringSync(), contains('fatal but alive'));
+
+      await Sentrinel.flush();
+      expect(captured.rows('/api/ingest/errors', 'errors'), hasLength(1));
+      expect(File('${storage.path}/pending.ndjson').existsSync(), isFalse,
+          reason: 'still on disk, the next launch would send it a second time');
+    });
+
+    test('a replay that fails is tried again on the next launch', () async {
+      // Launch one: crash.
+      init();
+      Sentrinel.captureError(StateError('survives a bad network'), StackTrace.current, fatal: true);
+      Sentrinel.collector?.dispose();
+
+      // Launch two: offline. The old reader had already deleted the file.
+      init(client: MockClient((_) async => throw const SocketException('offline')));
+      await Sentrinel.flush();
+      Sentrinel.collector?.dispose();
+
+      // Launch three: online.
+      final third = Captured();
+      init(client: third.client());
+      await Sentrinel.flush();
+
+      expect(
+        third.rows('/api/ingest/errors', 'errors').where(
+            (e) => '${e['errorMessage']}'.contains('survives a bad network')),
+        hasLength(1),
+      );
+      expect(File('${storage.path}/inflight.ndjson').existsSync(), isFalse);
+      expect(File('${storage.path}/pending.ndjson').existsSync(), isFalse);
+    });
+
+    test('a replay that fails is retried within the same run, too', () async {
+      init();
+      Sentrinel.captureError(StateError('retry me'), StackTrace.current, fatal: true);
+      Sentrinel.collector?.dispose();
+
+      var up = false;
+      final later = Captured();
+      init(client: MockClient((req) async {
+        if (!up) throw const SocketException('offline');
+        later.byPath
+            .putIfAbsent(req.url.path, () => [])
+            .add(jsonDecode(req.body) as Map<String, dynamic>);
+        return http.Response('{}', 200);
+      }));
+      await Sentrinel.flush();
+      up = true;
+      await Sentrinel.flush();
+
+      expect(later.rows('/api/ingest/errors', 'errors').where(
+          (e) => '${e['errorMessage']}'.contains('retry me')), hasLength(1));
+      expect(File('${storage.path}/inflight.ndjson').existsSync(), isFalse);
+    });
+
+    test('a record the server refuses outright is not replayed forever', () async {
+      init();
+      Sentrinel.captureError(StateError('malformed'), StackTrace.current, fatal: true);
+      Sentrinel.collector?.dispose();
+
+      init(client: MockClient((_) async => http.Response('{"error":"bad"}', 400)));
+      await Sentrinel.flush();
+      expect(File('${storage.path}/inflight.ndjson').existsSync(), isFalse);
+    });
+
+    test('an older SDK\'s spool, without ids, still replays', () async {
+      storage.createSync(recursive: true);
+      File('${storage.path}/pending.ndjson').writeAsStringSync(
+        '${jsonEncode({'kind': 'error', 'record': {'method': 'APP', 'path': 'app/crash', 'statusCode': 500, 'timestamp': DateTime.now().toUtc().toIso8601String(), 'errorMessage': 'from 0.2'}})}\n',
+      );
+      init();
+      await Sentrinel.flush();
+      expect(captured.rows('/api/ingest/errors', 'errors').single['errorMessage'], 'from 0.2');
+      expect(File('${storage.path}/inflight.ndjson').existsSync(), isFalse);
+    });
+  });
+
+  group('without a disk', () {
+    test('a fatal error still reaches the server straight away', () async {
+      // On Flutter web, and with persistCrashes off, there is nowhere durable
+      // to put it. It used to sit in a list that was only read at init.
+      init(persist: false);
+      Sentrinel.captureError(StateError('no disk'), StackTrace.current, fatal: true);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(captured.rows('/api/ingest/errors', 'errors').single['errorMessage'],
+          contains('no disk'));
+    });
+  });
+
+  group('backgrounding', () {
+    test('ends the session cleanly, so an OS kill is not abnormal', () async {
+      init();
+      await Sentrinel.onBackground();
+      // The OS kills the backgrounded app: no close(), no further code.
+      Sentrinel.collector?.dispose();
+
+      final ended = captured.rows('/api/ingest/sessions', 'sessions').where((s) => s['durationMs'] != null);
+      expect(ended, isNotEmpty, reason: 'the session ends with a duration');
+
+      final second = Captured();
+      init(client: second.client());
+      expect(Sentrinel.previousRunCrashed, isFalse);
+      await Sentrinel.flush();
+      expect(second.rows('/api/ingest/sessions', 'sessions').map((s) => s['status']),
+          isNot(contains('abnormal')));
+    });
+
+    test('a quick return is the same session; a long absence starts a new one', () async {
+      init();
+      await Sentrinel.flush();
+      final first = captured.rows('/api/ingest/sessions', 'sessions').single['sessionId'];
+
+      await Sentrinel.onBackground();
+      Sentrinel.onForeground();
+      Sentrinel.info('still here');
+      // The marker is back: a crash from here on is still noticed.
+      expect(File('${storage.path}/session.json').existsSync(), isTrue);
+
+      final saved = Sentrinel.sessionTimeout;
+      Sentrinel.sessionTimeout = Duration.zero;
+      await Sentrinel.onBackground();
+      Sentrinel.onForeground();
+      Sentrinel.sessionTimeout = saved;
+      await Sentrinel.flush();
+
+      final ids = captured.rows('/api/ingest/sessions', 'sessions').map((s) => s['sessionId']).toSet();
+      expect(ids, contains(first));
+      expect(ids.length, 2);
     });
   });
 
