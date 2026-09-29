@@ -10,7 +10,9 @@
 //
 //   1. **Bounded.** Memory is the app's, not ours. Past the cap the *oldest*
 //      payload is dropped, because in an outage the newest data is the data
-//      someone is staring at a dashboard waiting for.
+//      someone is staring at a dashboard waiting for. The cap is on bytes as
+//      well as count: a request-log batch can be megabytes, and a hundred of
+//      them is not a number anyone meant when they set "100".
 //
 //   2. **Only what retrying can fix.** A 401 or a 422 will fail identically
 //      forever; retrying it wastes the queue on a payload that can never land
@@ -20,6 +22,10 @@
 //   3. **Backed off, with jitter.** Every instance of a service restarts its
 //      collector at the same moment, so a fixed delay means they all retry in
 //      lockstep and hit a recovering API together.
+//
+// The collector keeps one queue per payload type, so an outage that fills the
+// queue with request logs cannot evict the small metrics batches the headline
+// numbers are built from.
 
 export interface QueuedPayload {
   path: string;
@@ -30,11 +36,15 @@ export interface QueuedPayload {
   nextAttemptAt: number;
   /** For the "dropped N" accounting, so a drop is never silent. */
   queuedAt: number;
+  /** Serialized size, for the byte budget. */
+  bytes: number;
 }
 
 export interface RetryOptions {
   /** Payloads held at once. Beyond this the oldest is dropped. */
   maxQueued?: number;
+  /** Serialized bytes held at once. Beyond this the oldest is dropped. */
+  maxQueuedBytes?: number;
   /** Attempts per payload before it is abandoned. */
   maxAttempts?: number;
   /** First backoff step; doubles each attempt. */
@@ -45,6 +55,7 @@ export interface RetryOptions {
 
 const DEFAULTS = {
   maxQueued: 100,
+  maxQueuedBytes: 8 * 1024 * 1024,
   maxAttempts: 5,
   baseDelayMs: 5_000,
   maxDelayMs: 300_000,
@@ -53,11 +64,12 @@ const DEFAULTS = {
 /**
  * Is this failure worth trying again?
  *
- * `status` is undefined for a transport error — DNS, TLS, connection refused —
- * which is the most retryable case there is.
+ * `status` is undefined for a transport error — DNS, TLS, connection refused,
+ * a timeout — which is the most retryable case there is.
  */
 export function isRetryable(status?: number): boolean {
   if (status === undefined) return true; // never reached the server
+  if (status === 408) return true; // the server gave up waiting; try again
   if (status === 429) return true; // rate limited: back off and retry
   if (status >= 500) return true; // their problem, probably temporary
   return false; // 4xx: the payload or the key is wrong, and will stay wrong
@@ -65,17 +77,26 @@ export function isRetryable(status?: number): boolean {
 
 export class RetryQueue {
   private queue: QueuedPayload[] = [];
+  private bytes = 0;
   private readonly opts: Required<RetryOptions>;
   /** Counted rather than logged per-item, so an outage warns once. */
   private droppedForSpace = 0;
   private droppedForAttempts = 0;
 
   constructor(options: RetryOptions = {}) {
-    this.opts = { ...DEFAULTS, ...options };
+    const defined = Object.fromEntries(
+      Object.entries(options).filter(([, v]) => v !== undefined)
+    ) as RetryOptions;
+    this.opts = { ...DEFAULTS, ...defined };
   }
 
   get size(): number {
     return this.queue.length;
+  }
+
+  /** Serialized bytes currently held. */
+  get queuedBytes(): number {
+    return this.bytes;
   }
 
   /** Payloads discarded since the last report, and why. */
@@ -92,7 +113,7 @@ export class RetryQueue {
    * Returns false when it was dropped instead — either the failure is not
    * retryable, or it has already had every attempt it is going to get.
    */
-  enqueue(path: string, body: unknown, status: number | undefined, attempts = 0): boolean {
+  enqueue(path: string, body: unknown, status: number | undefined, attempts = 0, bytes = 0): boolean {
     if (!isRetryable(status)) return false;
 
     if (attempts + 1 >= this.opts.maxAttempts) {
@@ -112,13 +133,28 @@ export class RetryQueue {
       attempts: next,
       nextAttemptAt: Date.now() + jitter,
       queuedAt: Date.now(),
+      bytes,
     });
+    this.bytes += bytes;
 
     // Oldest out, not newest: during an outage the recent window is the one
-    // worth keeping, and the stale end is the part nobody will look at.
-    while (this.queue.length > this.opts.maxQueued) {
-      this.queue.shift();
+    // worth keeping, and the stale end is the part nobody will look at. The
+    // newest payload is kept even if it alone is over the byte budget —
+    // refusing it would drop the freshest data to protect staler data.
+    while (
+      this.queue.length > 1 &&
+      (this.queue.length > this.opts.maxQueued || this.bytes > this.opts.maxQueuedBytes)
+    ) {
+      const dropped = this.queue.shift()!;
+      this.bytes -= dropped.bytes;
       this.droppedForSpace++;
+    }
+    if (this.queue.length > this.opts.maxQueued) {
+      // maxQueued of 0: hold nothing.
+      const dropped = this.queue.shift()!;
+      this.bytes -= dropped.bytes;
+      this.droppedForSpace++;
+      return false;
     }
 
     return true;
@@ -133,11 +169,21 @@ export class RetryQueue {
       (item.nextAttemptAt <= now ? ready : waiting).push(item);
     }
     this.queue = waiting;
+    this.bytes = waiting.reduce((sum, i) => sum + i.bytes, 0);
     return ready;
+  }
+
+  /** Everything, due or not — the last attempt at shutdown. */
+  takeAll(): QueuedPayload[] {
+    const all = this.queue;
+    this.queue = [];
+    this.bytes = 0;
+    return all;
   }
 
   /** Drop everything — used on shutdown once a final flush has been tried. */
   clear(): void {
     this.queue = [];
+    this.bytes = 0;
   }
 }

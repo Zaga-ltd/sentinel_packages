@@ -200,9 +200,13 @@ export function traceToMarkdown(res: Any): string {
   const byStart = (a: Any, b: Any) => new Date(a.startTime ?? 0).getTime() - new Date(b.startTime ?? 0).getTime();
   const walk = (parent: string | null, depth: number) => {
     for (const s of (children.get(parent) ?? []).sort(byStart)) {
-      const err = s.error || s.status === "error" || (s.statusCode && s.statusCode >= 500) ? " **[error]**" : "";
-      lines.push(`${"  ".repeat(depth)}- ${s.name ?? s.kind ?? "span"} — ${s.durationMs ?? "?"}ms${err}`);
-      if (s.errorMessage) lines.push(`${"  ".repeat(depth + 1)}${clip(s.errorMessage, 300)}`);
+      // The API reports a span's outcome the OpenTelemetry way: statusCode is
+      // the string "OK" / "ERROR" / "UNSET" and the reason is statusMessage.
+      // Comparing statusCode to 500 never matched, so no span was ever marked.
+      const failed = String(s.statusCode ?? "").toUpperCase() === "ERROR" || s.error === true || s.status === "error";
+      lines.push(`${"  ".repeat(depth)}- ${s.name ?? s.kind ?? "span"} — ${s.durationMs ?? "?"}ms${failed ? " **[error]**" : ""}`);
+      const why = s.statusMessage ?? s.errorMessage;
+      if (why) lines.push(`${"  ".repeat(depth + 1)}${clip(why, 300)}`);
       walk(idOf(s), depth + 1);
     }
   };
@@ -272,10 +276,16 @@ export function slowQueriesToMarkdown(res: { queries?: Any[] }): string {
     lines.push(`${n + 1}. ${bits.join(" · ")}`);
     lines.push(`   id: \`${q.queryid}\``);
     if (q.queryText) lines.push("", fence(clip(String(q.queryText).trim(), 1200), "sql"));
+    // Callers are Postgres roles with their call counts — what
+    // pg_stat_statements knows. It has no idea which endpoint sent a query,
+    // so this must not read as one; the trace is what links the two.
     const callers: Any[] = q.callers ?? [];
     if (callers.length) {
-      const names = callers.map((c) => c.endpoint ?? c.path ?? c.name ?? JSON.stringify(c)).filter(Boolean);
-      if (names.length) lines.push(`   called from: ${names.slice(0, 5).join(", ")}`);
+      const roles = callers
+        .slice(0, 5)
+        .map((c) => `${c.usename ?? "unknown"}${c.calls != null ? ` (${Number(c.calls).toLocaleString("en-US")} calls)` : ""}`);
+      const more = Number(q.callerCount ?? callers.length) - Math.min(callers.length, 5);
+      lines.push(`   run by: ${roles.join(", ")}${more > 0 ? ` and ${more} more` : ""}`);
     }
     lines.push("");
   });

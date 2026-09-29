@@ -123,13 +123,19 @@ class SentrinelMiddleware:
         # server work it caused are two unrelated rows, and the one timeline
         # spanning both — the reason the SDKs send the header at all — does not
         # exist.
-        incoming = parse_traceparent((getattr(request, "META", {}) or {}).get("HTTP_TRACEPARENT"))
+        meta = getattr(request, "META", {}) or {}
+        incoming = parse_traceparent(meta.get("HTTP_TRACEPARENT"))
         state = context.begin(
             consumer=self._consumer(request),
             trace_id=incoming.trace_id if incoming else generate_trace_id(),
             span_id=generate_span_id(),
             parent_span_id=incoming.parent_span_id if incoming else None,
         )
+        # The install the phone or browser SDK says it is: the one thread that
+        # ties a guest's requests together before anybody has signed in.
+        device = context.device_id(meta.get("HTTP_X_SENTRINEL_DEVICE"))
+        if device:
+            state["attributes"]["device.id"] = device
         started = time.perf_counter()
         state["started_iso"] = _now_iso()
         request_body = self._read_request_body(request)
@@ -173,7 +179,7 @@ class SentrinelMiddleware:
                     method=getattr(request, "method", "GET"),
                     route=route_for(request, _path(request)),
                     status=status_for_exception(exception),
-                    state=state,
+                    state={**state, "consumer": self._settled_consumer(request, state)},
                 )
             )
         except Exception as exc:
@@ -192,6 +198,23 @@ class SentrinelMiddleware:
             return resolver(request) if resolver else _default_consumer(request)
         except Exception:
             return None
+
+    def _settled_consumer(self, request: Any, state: dict[str, Any]) -> str | None:
+        """Who the request belonged to, asked once the view has run.
+
+        Identity may only have been decided inside the view. The header the
+        phone and browser SDKs send comes last, and only here: at the start of
+        the request ``request.user`` does not exist yet, and a guest id taken
+        then would outrank the user the view went on to sign in.
+        """
+        return (
+            state.get("consumer")
+            or self._consumer(request)
+            or context.client_consumer(
+                (getattr(request, "META", {}) or {}).get("HTTP_X_SENTRINEL_CONSUMER"),
+                self.config.trust_client_consumer,
+            )
+        )
 
     def _read_request_body(self, request: Any) -> bytes | None:
         """Read the body before the view consumes it, if it was asked for.
@@ -223,8 +246,7 @@ class SentrinelMiddleware:
         method = getattr(request, "method", "GET")
         path = _path(request)
         route = route_for(request, path)
-        # Identity may only have been decided inside the view.
-        consumer = state.get("consumer") or self._consumer(request)
+        consumer = self._settled_consumer(request, state)
 
         request_size = int(getattr(request, "META", {}).get("CONTENT_LENGTH") or 0)
         response_size = _response_size(response)
@@ -264,7 +286,10 @@ class SentrinelMiddleware:
             logs = state.get("logs") or []
             if logs:
                 for line in logs:
-                    line.setdefault("consumerIdentifier", consumer)
+                    # The handler writes the key, as None when nobody was known
+                    # yet — so it is filled, not defaulted.
+                    if not line.get("consumerIdentifier"):
+                        line["consumerIdentifier"] = consumer
                 self.collector.record_logs(logs)
 
         if not cfg.capture_requests:

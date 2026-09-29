@@ -129,6 +129,18 @@ export function enterRequestScope(requestId: string, sink?: LogSink): void {
 }
 
 /**
+ * Run `fn` inside a request scope that ends when it does.
+ *
+ * The adapters that wrap a handler (Express, Next, Bun) use this rather than
+ * enterWith(): enterWith() inside an async wrapper changes the *caller's*
+ * context too, so the framework's code after the handler returned would go on
+ * attributing its logs to a request that had finished.
+ */
+export function runInRequestScope<T>(requestId: string, sink: LogSink | undefined, fn: () => T): T {
+  return requestStorage.run({ requestId, sink }, fn);
+}
+
+/**
  * Leave the request scope.
  *
  * enterWith() has no natural end — it persists for the remainder of the async
@@ -154,11 +166,47 @@ export function currentRequestId(): string | undefined {
 // checkouts for enterprise customers with the new pricing flag" is a query
 // against one table, not a correlation exercise.
 
-const canonicalStorage = new AsyncLocalStorage<{ fields: Record<string, unknown> }>();
+/** One request's canonical fields. Held by reference so they can be drained anywhere. */
+export interface CanonicalScope {
+  fields: Record<string, unknown>;
+}
+
+const canonicalStorage = new AsyncLocalStorage<CanonicalScope>();
 
 /** Opens the canonical-field collector for this request. */
-export function beginCanonicalScope(): void {
-  canonicalStorage.enterWith({ fields: {} });
+export function beginCanonicalScope(): CanonicalScope {
+  const scope: CanonicalScope = { fields: {} };
+  canonicalStorage.enterWith(scope);
+  return scope;
+}
+
+/** A canonical scope not yet entered — pair with runInCanonicalScope(). */
+export function createCanonicalScope(): CanonicalScope {
+  return { fields: {} };
+}
+
+/** Enter an existing scope for the rest of this async execution. */
+export function enterCanonicalScope(scope: CanonicalScope): void {
+  canonicalStorage.enterWith(scope);
+}
+
+export function runInCanonicalScope<T>(scope: CanonicalScope, fn: () => T): T {
+  return canonicalStorage.run(scope, fn);
+}
+
+/**
+ * Drain a scope held by reference.
+ *
+ * The recording step of an adapter runs from a response event, whose async
+ * context is not reliably the handler's — reading the ambient store there can
+ * find nothing, or another request's fields. Holding the scope object and
+ * draining it directly cannot.
+ */
+export function drainCanonicalScope(scope: CanonicalScope | undefined): Record<string, unknown> | undefined {
+  if (!scope || !Object.keys(scope.fields).length) return undefined;
+  const fields = { ...scope.fields };
+  scope.fields = {};
+  return fields;
 }
 
 /**

@@ -238,6 +238,123 @@ class TestIdentity:
         assert row["consumerIdentifier"] == "acme"
 
 
+class _User:
+    is_authenticated = True
+    pk = 7
+
+
+class TestClientIdentity:
+    """The phone and browser SDKs name the install in x-sentrinel-consumer and
+    x-sentrinel-device. The server's own idea of who is calling always wins."""
+
+    GUEST = {"HTTP_X_SENTRINEL_CONSUMER": "guest:3f9c", "HTTP_X_SENTRINEL_DEVICE": "3f9c"}
+
+    def _row(self, sent):
+        return sent.rows("/api/ingest/requests", "requests")[0]
+
+    def test_a_guest_header_names_the_consumer_when_nothing_else_does(self, build, sent):
+        mw = build()
+        mw(rf.get("/ok/", **self.GUEST))
+        mw.collector.flush()
+        assert self._row(sent)["consumerIdentifier"] == "guest:3f9c"
+        assert sent.rows("/api/ingest/metrics", "consumers")[0]["identifier"] == "guest:3f9c"
+
+    def test_the_resolver_wins_over_the_header(self, build, sent):
+        mw = build(CONSUMER_IDENTIFIER=lambda request: "tenant-42")
+        mw(rf.get("/ok/", **self.GUEST))
+        mw.collector.flush()
+        assert self._row(sent)["consumerIdentifier"] == "tenant-42"
+
+    def test_the_signed_in_user_wins_over_the_header(self, build, sent):
+        from django.http import HttpResponse
+
+        # AuthenticationMiddleware sits below this one, so request.user only
+        # exists once the request is on its way back.
+        def view(request):
+            request.user = _User()
+            return HttpResponse("ok")
+
+        mw = build(view)
+        mw(rf.get("/ok/", **self.GUEST))
+        mw.collector.flush()
+        assert self._row(sent)["consumerIdentifier"] == "7"
+
+    def test_a_header_naming_a_real_user_is_ignored_by_default(self, build, sent):
+        mw = build()
+        mw(rf.get("/ok/", HTTP_X_SENTRINEL_CONSUMER="7"))
+        mw(rf.get("/ok/", HTTP_X_SENTRINEL_CONSUMER="guest:"))
+        mw.collector.flush()
+        assert [r["consumerIdentifier"] for r in sent.rows("/api/ingest/requests", "requests")] == [None, None]
+
+    def test_any_header_is_taken_when_the_client_is_trusted(self, build, sent):
+        mw = build(TRUST_CLIENT_CONSUMER=True)
+        mw(rf.get("/ok/", HTTP_X_SENTRINEL_CONSUMER="user_7"))
+        mw.collector.flush()
+        assert self._row(sent)["consumerIdentifier"] == "user_7"
+
+    def test_the_header_is_bounded(self, build, sent):
+        mw = build()
+        mw(rf.get("/ok/", HTTP_X_SENTRINEL_CONSUMER="guest:" + "a" * 500, HTTP_X_SENTRINEL_DEVICE="d" * 500))
+        mw.collector.flush()
+        row = self._row(sent)
+        assert row["consumerIdentifier"] == ("guest:" + "a" * 500)[:255]
+        assert row["attributes"]["device.id"] == "d" * 255
+
+    def test_the_device_is_an_attribute_of_the_request(self, build, sent):
+        mw = build()
+        mw(rf.get("/ok/", **self.GUEST))
+        mw.collector.flush()
+        assert self._row(sent)["attributes"] == {"device.id": "3f9c"}
+
+    def test_no_headers_record_nothing(self, build, sent):
+        mw = build()
+        mw(rf.get("/ok/", HTTP_X_SENTRINEL_DEVICE=""))
+        mw.collector.flush()
+        row = self._row(sent)
+        assert row["consumerIdentifier"] is None
+        assert "attributes" not in row
+
+    def test_an_exception_belongs_to_the_guest_and_the_device(self, build, sent):
+        # Django calls process_exception from inside get_response, while the
+        # request's state is still live.
+        def boom(request):
+            exc = ValueError("kaboom")
+            mw.process_exception(request, exc)
+            raise exc
+
+        mw = build(boom)
+        with pytest.raises(ValueError):
+            mw(rf.get("/boom/", **self.GUEST))
+        mw.collector.flush()
+        err = sent.rows("/api/ingest/errors", "errors")[0]
+        assert err["consumerIdentifier"] == "guest:3f9c"
+        assert err["attributes"] == {"device.id": "3f9c"}
+
+    def test_a_log_line_belongs_to_the_guest(self, build, sent):
+        import logging
+
+        from django.http import HttpResponse
+
+        from sentrinel_django import SentrinelLogHandler
+
+        handler = SentrinelLogHandler()
+        logger = logging.getLogger("shop.cart")
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+
+        def view(request):
+            logger.info("cart opened")
+            return HttpResponse("ok")
+
+        try:
+            mw = build(view)
+            mw(rf.get("/ok/", **self.GUEST))
+            mw.collector.flush()
+        finally:
+            logger.removeHandler(handler)
+        assert sent.rows("/api/ingest/logs", "logs")[0]["consumerIdentifier"] == "guest:3f9c"
+
+
 class TestLogs:
     def test_a_log_line_carries_the_request_that_wrote_it(self, build, sent):
         import logging
@@ -552,7 +669,7 @@ class TestTunnel:
     def _post(self, body):
         import json as _json
 
-        return rf.post("/api/_sentrinel", data=_json.dumps(body), content_type="application/json")
+        return rf.post("/api/sentrinel", data=_json.dumps(body), content_type="application/json")
 
     def test_a_batch_is_forwarded_to_the_right_ingest_paths(self, build, sent):
         from sentrinel_django import sentrinel_tunnel
@@ -596,8 +713,8 @@ class TestTunnel:
         from sentrinel_django import sentrinel_tunnel
 
         build()
-        assert sentrinel_tunnel(rf.get("/api/_sentrinel")).status_code == 405
-        assert sentrinel_tunnel(rf.post("/api/_sentrinel", data=b"not json", content_type="application/json")).status_code == 400
+        assert sentrinel_tunnel(rf.get("/api/sentrinel")).status_code == 405
+        assert sentrinel_tunnel(rf.post("/api/sentrinel", data=b"not json", content_type="application/json")).status_code == 400
 
 
 class TestModule:
@@ -823,7 +940,7 @@ class TestTunnelIsNotTraffic:
         from sentrinel_django import sentrinel_tunnel
 
         mw = build(sentrinel_tunnel)
-        mw(rf.post("/api/_sentrinel", data=json.dumps({"errors": [{"m": 1}]}), content_type="application/json"))
+        mw(rf.post("/api/sentrinel", data=json.dumps({"errors": [{"m": 1}]}), content_type="application/json"))
         sent.posts.clear()
         mw.collector.flush()
         assert sent.payload("/api/ingest/requests") is None

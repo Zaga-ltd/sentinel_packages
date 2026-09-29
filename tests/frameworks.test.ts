@@ -11,24 +11,23 @@ describe("Multi-Framework Plugin Support", () => {
     expect(headers["x-trace-id"]).toMatch(/^[0-9a-f]{32}$/);
   });
 
-  it("sentrinelNextMiddleware processes Next.js request and injects W3C headers", async () => {
+  it("sentrinelNextMiddleware passes every request through to its route", async () => {
+    // The old middleware answered `new Response(null, { status: 200 })`, which
+    // Next treats as the final response — every matched route came back blank.
+    // A pass-through carries `x-middleware-next`, exactly as NextResponse.next().
     const middleware = sentrinelNextMiddleware({
       serverUrl: "http://localhost:3001",
       appName: "nextjs-app",
       env: "test",
     });
 
-    const req = new Request("http://localhost:3000/api/v1/checkout", {
-      headers: { "x-consumer-id": "web_react_client" },
-    });
-
+    const req = new Request("http://localhost:3000/api/v1/checkout");
     const res = await middleware(req);
-    expect(res.headers.get("traceparent")).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
-    expect(res.headers.get("x-trace-id")).toMatch(/^[0-9a-f]{32}$/);
+    expect(res.headers.get("x-middleware-next")).toBe("1");
+    expect(res.body).toBeNull();
 
-    // Record the response after handler completes
-    const handlerRes = new Response(JSON.stringify({ ok: true }), { status: 200 });
-    middleware.recordResponse(req, handlerRes);
+    // Old call sites still compile and do nothing harmful.
+    middleware.recordResponse(req, new Response("{}"));
   });
 
   it("sentrinelExpressMiddleware initializes express middleware function", () => {

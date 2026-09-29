@@ -111,7 +111,8 @@ application's own telemetry cannot see.
 1. `get_trace` on a slow request first — it says whether the time is in your
    code, an outbound call, or the database.
 2. If it is the database: `list_databases` → `slow_queries <db-id>` ranks query
-   shapes by share of execution time and names the endpoints that called them.
+   shapes by share of execution time and names the database roles that ran
+   them. It cannot name the endpoint — the trace from step 1 does that.
 3. `db_activity <db-id>` when no single query looks expensive — wait events,
    blocking chains, longest-running statements.
 4. `db_health <db-id>` for connections, idle-in-transaction, deadlocks, temp
@@ -175,7 +176,8 @@ never appear in output — the server and CLI refuse to echo them.
 | `is a server (…) key` | An ingest key (`snt_live_`, `snt_dev_`, mobile, collector, OTel) was configured. Those write telemetry and deliberately cannot read. An **AI agent** key is needed. |
 | `401` | Revoked or mistyped key. The user must issue a new one; you cannot. |
 | `403` on `set_issue_status` | Read-only agent key. Report the status change you would have made. |
-| `403` on everything | The key is pinned to a different app than the repo you are in. |
+| `403` on an id | The issue, request, trace or database belongs to another app — ids do not cross apps, and a key reads only its own. `sentrinel apps` shows which apps have keys here; `sentrinel use <profile>` switches. |
+| Results from the wrong app | Not a refusal: a key with no app named reads its own app. If that is not the app for this repo, the key or the active profile is. |
 | Empty results | Almost always the window. See above. |
 
 Report these to the user in one line and continue with what you can still do.

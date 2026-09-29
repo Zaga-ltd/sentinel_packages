@@ -1,10 +1,11 @@
 name: sentrinel
 description: >-
-  Sentrinel client for Flutter and Dart. Records every outgoing request, reports
-  uncaught Dart errors as crashes that survive the process, and propagates W3C
-  traceparent so a mobile call and the backend request it triggers land on one
-  timeline. Native iOS/Android crashes are not covered.
-version: 0.2.0
+  Sentrinel client for Flutter and Dart. Records every outgoing request and
+  every uncaught Dart error, keeps crash reports on disk until the server has
+  them, and propagates W3C traceparent to your own backends so a mobile call and
+  the backend request it triggers land on one timeline. Native iOS/Android
+  crashes are not covered.
+version: 0.3.0
 repository: https://github.com/Zaga-ltd/sentinel_packages
 homepage: https://sentrinel.dev
 

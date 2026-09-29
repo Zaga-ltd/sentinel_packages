@@ -54,6 +54,11 @@ function makeApp(handler: (ctx: any) => unknown) {
     .post("/work", handler);
 }
 
+/** Every trace shipped, across however many batches carried them. */
+function shippedTraces(): any[] {
+  return (captured["/api/ingest/traces"] ?? []).flatMap((batch: any) => batch.traces ?? []);
+}
+
 async function callAndFlush(app: Elysia, body: unknown = {}) {
   await app.handle(
     new Request("http://local/work", {
@@ -76,7 +81,8 @@ describe("one request ships a connected set of records", () => {
 
     await callAndFlush(app);
 
-    const traces = captured["/api/ingest/traces"] ?? [];
+    // Traces travel batched: one POST carries `traces: [...]`.
+    const traces = shippedTraces();
     expect(traces.length).toBeGreaterThan(0);
 
     const trace = traces[0];
@@ -99,7 +105,7 @@ describe("one request ships a connected set of records", () => {
 
     await callAndFlush(app);
 
-    const trace = (captured["/api/ingest/traces"] ?? [])[0];
+    const trace = shippedTraces()[0];
     const requestLog = (captured["/api/ingest/requests"] ?? [])[0]?.requests?.[0];
     const appLog = (captured["/api/ingest/logs"] ?? [])[0]?.logs?.find(
       (l: any) => l.message === "Something notable"
@@ -136,7 +142,7 @@ describe("one request ships a connected set of records", () => {
 
     await callAndFlush(app);
 
-    const trace = (captured["/api/ingest/traces"] ?? [])[0];
+    const trace = shippedTraces()[0];
     const requestLog = (captured["/api/ingest/requests"] ?? [])[0]?.requests?.[0];
     const error = (captured["/api/ingest/errors"] ?? [])[0]?.errors?.[0];
 

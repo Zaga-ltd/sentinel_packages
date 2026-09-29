@@ -23,7 +23,7 @@ def sentrinel_tunnel(request: Any) -> Any:
     from sentrinel_django import sentrinel_tunnel
 
     urlpatterns = [
-        path("api/_sentrinel", sentrinel_tunnel),
+        path("api/sentrinel", sentrinel_tunnel),
         ...
     ]
     ```

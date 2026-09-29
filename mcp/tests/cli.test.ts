@@ -2,7 +2,11 @@
 // same client calls — and refuse anything it does not understand loudly.
 
 import { describe, expect, test } from "bun:test";
-import { parseArgs, run } from "../src/cli";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { parseArgs, run, writePlanned } from "../src/cli";
 import { planFromArgs } from "../src/skill";
 import type { SentrinelClient } from "../src/client";
 
@@ -29,6 +33,38 @@ describe("parseArgs", () => {
     expect(p.command).toBe("issue");
     expect(p.positional).toEqual(["abc"]);
     expect(p.flags).toEqual({ period: "24h", limit: "5", json: true });
+  });
+
+  test("a switch never takes the next word as its value", () => {
+    // `sentrinel issue --json 5f3ac1` used to read the id as --json's value.
+    const p = parseArgs(["issue", "--json", "5f3ac1"]);
+    expect(p.positional).toEqual(["5f3ac1"]);
+    expect(p.flags.json).toBe(true);
+    expect(parseArgs(["skill", "install", "--cursor", "extra"]).positional).toEqual(["install", "extra"]);
+    // A value-taking flag still takes one.
+    expect(parseArgs(["logs", "--level", "error"]).flags.level).toBe("error");
+  });
+});
+
+describe("writePlanned", () => {
+  test("a file where a directory belongs is a sentence that says what to type", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sentrinel-skill-"));
+    // Zed's .rules is a file; --dir .rules would write .rules/SKILL.md.
+    await writeFile(join(dir, ".rules"), "my rules\n");
+    const files = planFromArgs(["install"], { dir: join(dir, ".rules") }, { home: "/h", cwd: dir }).files;
+    await expect(writePlanned(files)).rejects.toThrow(/--zed/);
+    expect(await readFile(join(dir, ".rules"), "utf8")).toBe("my rules\n");
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test("merges into a shared file instead of overwriting it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sentrinel-skill-"));
+    await writeFile(join(dir, ".rules"), "my rules\n");
+    await writePlanned(planFromArgs(["install"], { zed: true }, { home: "/h", cwd: dir }).files);
+    const out = await readFile(join(dir, ".rules"), "utf8");
+    expect(out).toStartWith("my rules");
+    expect(out).toContain("<!-- sentrinel:skill:start -->");
+    await rm(dir, { recursive: true, force: true });
   });
 });
 

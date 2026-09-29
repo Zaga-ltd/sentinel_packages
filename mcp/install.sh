@@ -33,6 +33,15 @@ BIN_DIR="${SENTRINEL_BIN_DIR:-$HOME/.local/bin}"
 API_URL="${SENTRINEL_API_URL:-https://api.sentrinel.dev}"
 API_KEY="${SENTRINEL_API_KEY:-}"
 
+# The ed25519 key the release manifest is signed with — the same one the
+# installed CLI checks its own updates against. apps/web/build.ts writes it in
+# from packages/mcp/src/update-key.ts when the site is built; while it is the
+# placeholder, the bundles are checked against the manifest's checksums only.
+UPDATE_PUBLIC_KEY="REPLACE_WITH_PUBLIC_KEY_BASE64"
+
+say()  { printf '  %s\n' "$*"; }
+fail() { printf '\n  %s\n\n' "$*" >&2; exit 1; }
+
 # ─── Profiles: one per app ───────────────────────────────────────────────────
 #
 # A key is pinned to one app, so watching a second app means a second key — and
@@ -52,9 +61,6 @@ case "$PROFILE" in
 esac
 ENV_FILE="$INSTALL_DIR/env${PROFILE:+.$PROFILE}"
 MCP_NAME="sentrinel${PROFILE:+-$PROFILE}"
-
-say()  { printf '  %s\n' "$*"; }
-fail() { printf '\n  %s\n\n' "$*" >&2; exit 1; }
 
 printf '\n  Sentrinel for coding agents %s\n\n' "$VERSION"
 
@@ -91,22 +97,86 @@ BUN_BIN="$(command -v bun)"
 
 mkdir -p "$INSTALL_DIR" "$BIN_DIR"
 
-# Download to .tmp and move into place, so an interrupted run never leaves a
-# half-written bundle that an agent will happily try to execute.
-fetch() {
-  local name="$1" dest="$INSTALL_DIR/$1"
-  curl -fsSL "$BASE_URL/$name" -o "$dest.tmp" \
+# Download everything to temporary names, check it, and only then move it into
+# place — so an interrupted or tampered download never leaves a bundle that an
+# agent will happily try to execute. Per-process names, so two installs at once
+# cannot write into each other's file.
+SUFFIX=".tmp.$$"
+trap 'rm -f "$INSTALL_DIR"/*"$SUFFIX"' EXIT
+
+download() {
+  local name="$1" dest="$INSTALL_DIR/$1$SUFFIX"
+  curl -fsSL "$BASE_URL/$name" -o "$dest" \
     || fail "Could not download $BASE_URL/$name"
   # A CDN that 404s to the marketing site would otherwise install an HTML page.
-  head -c 200 "$dest.tmp" | grep -qi '<!doctype\|<html' \
-    && { rm -f "$dest.tmp"; fail "$BASE_URL/$name returned a web page, not the bundle."; }
-  mv "$dest.tmp" "$dest"
-  chmod 0644 "$dest"
+  if head -c 200 "$dest" | grep -qi '<!doctype\|<html'; then
+    fail "$BASE_URL/$name returned a web page, not the bundle."
+  fi
 }
 
+# The check itself, run by Bun since it is installed by now. Its manifest
+# payload is the one in packages/mcp/src/signature.ts, copied — a test there
+# runs this exact text against a manifest the real signer produced, so the two
+# cannot drift. It prints the version on success and the reason on failure.
+#
+# read, not VERIFY_JS="$(cat <<'JS' …)": macOS's bash 3.2 scans a $( … ) for
+# its closing paren and trips over the quotes and parens inside the JS.
+# sentrinel:verify:start
+IFS= read -r -d '' VERIFY_JS <<'JS' || true
+const { createHash, createPublicKey, verify } = await import("node:crypto");
+const { readFileSync } = await import("node:fs");
+const env = process.env;
+const die = (why) => { console.error(why); process.exit(1); };
+let m;
+try { m = JSON.parse(readFileSync(env.SNT_MANIFEST, "utf8")); } catch { die("the release manifest is not JSON"); }
+const payload = (() => {
+  if (!m || typeof m.version !== "string" || !/^[0-9A-Za-z.+-]{1,64}$/.test(m.version)) return null;
+  if (!m.files || typeof m.files !== "object") return null;
+  const lines = ["sentrinel-mcp-manifest v1", `version ${m.version}`];
+  for (const name of Object.keys(m.files).sort()) {
+    const hash = m.files[name];
+    if (!/^[A-Za-z0-9._-]{1,128}$/.test(name) || typeof hash !== "string" || !/^[0-9a-f]{64}$/.test(hash)) return null;
+    lines.push(`file ${name} ${hash}`);
+  }
+  return lines.join("\n") + "\n";
+})();
+if (!payload) die("the release manifest is malformed");
+const key = env.SNT_KEY || "";
+if (key && key !== "REPLACE_WITH_PUBLIC_KEY_BASE64") {
+  if (typeof m.signature !== "string" || !m.signature) die("the release manifest is not signed");
+  let ok = false;
+  try {
+    const der = Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(key, "base64")]);
+    const pub = createPublicKey({ key: der, format: "der", type: "spki" });
+    ok = verify(null, Buffer.from(payload), pub, Buffer.from(m.signature, "base64"));
+  } catch {}
+  if (!ok) die("the release manifest's signature does not verify");
+}
+for (const name of (env.SNT_FILES || "").split(" ").filter(Boolean)) {
+  const want = m.files[name];
+  if (!want) die(`the release manifest does not list ${name}`);
+  const got = createHash("sha256").update(readFileSync(`${env.SNT_DIR}/${name}${env.SNT_SUFFIX}`)).digest("hex");
+  if (got !== want) die(`${name} does not match its published checksum`);
+}
+console.log(m.version);
+JS
+# sentrinel:verify:end
+
 say "Downloading the MCP server and CLI…"
-fetch sentrinel-mcp.js
-fetch sentrinel-cli.js
+download mcp-version.json
+download sentrinel-mcp.js
+download sentrinel-cli.js
+
+if ! VERIFIED="$(SNT_MANIFEST="$INSTALL_DIR/mcp-version.json$SUFFIX" SNT_KEY="$UPDATE_PUBLIC_KEY" \
+    SNT_DIR="$INSTALL_DIR" SNT_SUFFIX="$SUFFIX" SNT_FILES="sentrinel-mcp.js sentrinel-cli.js" \
+    "$BUN_BIN" -e "$VERIFY_JS" 2>&1)"; then
+  fail "Refusing to install: ${VERIFIED:-the download could not be verified}. Nothing was changed. If this persists, the release may be mid-publish — try again in a few minutes."
+fi
+
+for name in sentrinel-mcp.js sentrinel-cli.js; do
+  mv "$INSTALL_DIR/$name$SUFFIX" "$INSTALL_DIR/$name"
+  chmod 0644 "$INSTALL_DIR/$name"
+done
 
 # Launchers rather than symlinks: the bundle needs `bun` to run it, an agent's
 # config gets a bare command name it can spawn with no shell, and the key comes
@@ -116,6 +186,10 @@ fetch sentrinel-cli.js
 launcher() {
   cat > "$BIN_DIR/$1" <<LAUNCH
 #!/usr/bin/env bash
+# Where this install lives, for the bundle: the updater replaces files here and
+# the profile commands read key files from here. Always this directory, even
+# if SENTRINEL_HOME is set to something else — these are the bundles it runs.
+export SENTRINEL_HOME="$INSTALL_DIR"
 # The profile picks which key file to read, so one binary serves every app.
 # A variable already in the environment always wins, which keeps a one-off
 # \`SENTRINEL_API_KEY=… sentrinel issues\` working.

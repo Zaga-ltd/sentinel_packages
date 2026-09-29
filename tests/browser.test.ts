@@ -372,6 +372,210 @@ describe("browser SDK — requests", () => {
   });
 });
 
+// ─── Delivery, privacy and identity ─────────────────────────────────────────
+
+describe("browser SDK — delivery", () => {
+  let dom: ReturnType<typeof installDom>;
+  let sdk: typeof import("../src/browser");
+
+  beforeEach(async () => {
+    dom = installDom();
+    sdk = await freshSdk();
+  });
+  afterEach(clearDom);
+
+  const batchesTo = (path: string) =>
+    dom.sent.filter((c) => c.url === path).map((c) => JSON.parse(c.init.body));
+
+  test("posts to /api/sentrinel by default — a path Next's App Router can serve", async () => {
+    const s = sdk.initSentrinelBrowser({ flushInterval: 1_000_000 });
+    s.captureError(new Error("x"));
+    await s.flush();
+    expect(batchesTo("/api/sentrinel")).toHaveLength(1);
+  });
+
+  test("a failed batch is kept and resent, not lost", async () => {
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      let calls = 0;
+      dom.routes["/api/sentrinel"] = async () =>
+        ++calls === 1 ? new Response("down", { status: 503 }) : new Response("{}", { status: 202 });
+      const s = sdk.initSentrinelBrowser({ flushInterval: 1_000_000 });
+      s.captureError(new Error("survives an outage"));
+      await s.flush();
+
+      // Held with backoff; skip the wait.
+      (s as any).outbox.forEach((p: any) => (p.nextAt = 0));
+      await s.flush();
+
+      const [, ...after] = batchesTo("/api/sentrinel");
+      expect(after.flatMap((b) => b.errors).map((e: any) => e.errorMessage)).toEqual(["survives an outage"]);
+      // The session state that failed with the first batch is sent again —
+      // current, not the stale snapshot the failed batch carried.
+      const sessions = after.flatMap((b) => b.sessions);
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0].status).toBe("errored");
+    } finally {
+      console.warn = warn;
+    }
+  });
+
+  test("a batch refused as malformed is not retried forever", async () => {
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      dom.routes["/api/sentrinel"] = async () => new Response("bad", { status: 400 });
+      const s = sdk.initSentrinelBrowser({ flushInterval: 1_000_000 });
+      s.captureError(new Error("x"));
+      await s.flush();
+      expect((s as any).outbox).toHaveLength(0);
+    } finally {
+      console.warn = warn;
+    }
+  });
+
+  test("close() leaves history exactly as it found it", async () => {
+    const history = (globalThis as any).window.history;
+    const push = history.pushState;
+    const replace = history.replaceState;
+    (globalThis as any).history = history;
+    try {
+      const s = sdk.initSentrinelBrowser({ flushInterval: 1_000_000 });
+      expect(history.pushState).not.toBe(push);
+      await s.close();
+      // Both the pageview and the breadcrumb wrappers are gone, in that order.
+      expect(history.pushState).toBe(push);
+      expect(history.replaceState).toBe(replace);
+    } finally {
+      delete (globalThis as any).history;
+    }
+  });
+});
+
+describe("browser SDK — URLs are masked", () => {
+  let dom: ReturnType<typeof installDom>;
+  let sdk: typeof import("../src/browser");
+
+  beforeEach(async () => {
+    dom = installDom();
+    Object.assign((globalThis as any).location, {
+      href: "https://admin.example.com/reset?token=abc123&step=2",
+      pathname: "/reset",
+      search: "?token=abc123&step=2",
+    });
+    sdk = await freshSdk();
+  });
+  afterEach(clearDom);
+
+  test("in request records, error records and pageviews", async () => {
+    const s = sdk.initSentrinelBrowser({ flushInterval: 1_000_000 });
+    await (globalThis as any).window.fetch("/api/files?X-Amz-Signature=sig&api_key=k&v=1");
+    s.captureError(new Error("boom"));
+    // This DOM has no global `history`, so no automatic pageview; ask for one.
+    s.page();
+    await s.flush();
+
+    const body = JSON.stringify(dom.sent.filter((c) => c.url === "/api/sentrinel").map((c) => c.init.body));
+    for (const secret of ["abc123", "sig&", "api_key=k"]) expect(body).not.toContain(secret);
+
+    const batch = JSON.parse(dom.sent.find((c) => c.url === "/api/sentrinel")!.init.body);
+    const req = batch.requests.find((r: any) => r.path === "/api/files");
+    expect(req.queryParams).toEqual({ "X-Amz-Signature": "***", api_key: "***", v: "1" });
+    expect(req.attributes["http.url"]).toBe("/api/files?X-Amz-Signature=***&api_key=***&v=1");
+    expect(batch.errors[0].attributes["browser.url"]).toBe("https://admin.example.com/reset?token=***&step=2");
+    const pageview = batch.events.find((e: any) => e.kind === "pageview");
+    expect(pageview.name).toBe("/reset?token=***&step=2");
+  });
+});
+
+describe("browser SDK — device identity", () => {
+  let dom: ReturnType<typeof installDom>;
+  let sdk: typeof import("../src/browser");
+
+  beforeEach(async () => {
+    dom = installDom();
+    sdk = await freshSdk();
+  });
+  afterEach(clearDom);
+
+  test("signed-out records belong to guest:<device>, identify switches, identify(null) goes back", async () => {
+    const s = sdk.initSentrinelBrowser({ flushInterval: 1_000_000 });
+    const guest = `guest:${s.deviceId}`;
+    expect(s.consumer).toBe(guest);
+
+    s.captureError(new Error("before login"));
+    s.identify("user_7");
+    s.captureError(new Error("after login"));
+    s.identify(null);
+    s.captureError(new Error("after logout"));
+    await s.flush();
+
+    const batch = JSON.parse(dom.sent.at(-1)!.init.body);
+    expect(batch.errors.map((e: any) => e.consumerIdentifier)).toEqual([guest, "user_7", guest]);
+    expect(batch.errors.every((e: any) => e.attributes["device.id"] === s.deviceId)).toBe(true);
+    expect(batch.sessions[0].attributes["device.id"]).toBe(s.deviceId);
+    // The link from this device's history to the person.
+    const identify = batch.events.find((e: any) => e.kind === "identify");
+    expect(identify).toMatchObject({ anonymousId: s.deviceId, userId: "user_7" });
+  });
+
+  test("consumer and device headers go to your own origin, never to a third party", async () => {
+    const s = sdk.initSentrinelBrowser({ flushInterval: 1_000_000 });
+    await (globalThis as any).window.fetch("/api/orders");
+    await (globalThis as any).window.fetch("https://analytics.vendor.com/collect");
+
+    const own = new Headers(dom.sent.find((c) => c.url === "/api/orders")!.init.headers);
+    expect(own.get("x-sentrinel-consumer")).toBe(`guest:${s.deviceId}`);
+    expect(own.get("x-sentrinel-device")).toBe(s.deviceId);
+
+    const vendor = new Headers(dom.sent.find((c) => c.url.includes("vendor.com"))!.init?.headers ?? {});
+    expect(vendor.get("x-sentrinel-consumer")).toBeNull();
+    expect(vendor.get("x-sentrinel-device")).toBeNull();
+
+    await s.flush();
+    const batch = JSON.parse(dom.sent.at(-1)!.init.body);
+    const third = batch.requests.find((r: any) => r.attributes["http.host"] === "analytics.vendor.com");
+    expect(third.attributes["sentrinel.third_party"]).toBe(true);
+    const mine = batch.requests.find((r: any) => r.path === "/api/orders");
+    expect(mine.attributes["sentrinel.third_party"]).toBeUndefined();
+    expect(mine.attributes["sentrinel.kind"]).toBe("client");
+  });
+
+  test("a user id that cannot be a header value never breaks the app's fetch", async () => {
+    const s = sdk.initSentrinelBrowser({ flushInterval: 1_000_000 });
+    s.identify("Zoë");
+    const res = await (globalThis as any).window.fetch("/api/orders");
+    expect(res.status).toBe(202);
+  });
+});
+
+describe("rollup", () => {
+  test("weights sampled records by 1/sampleRate and skips third-party calls", async () => {
+    const { rollUpEndpoints } = await import("../src/rollup");
+    const [x] = rollUpEndpoints([
+      // Nine healthy requests kept at 10% stand for ninety.
+      ...Array.from({ length: 9 }, () => ({ method: "GET", path: "/x", statusCode: 200, responseTime: 10, sampleRate: 0.1 })),
+      // Errors are always kept, at rate 1.
+      { method: "GET", path: "/x", statusCode: 500, responseTime: 900, sampleRate: 1 },
+      { method: "GET", path: "/cdn", statusCode: 200, responseTime: 5, attributes: { "sentrinel.third_party": true } },
+    ]);
+    expect(x.requestCount).toBe(91);
+    expect(x.errorCount).toBe(1);
+    // Unweighted, the one error would drag p50 into it; weighted it is noise.
+    expect(x.p50ResponseTime).toBe(10);
+    expect(rollUpEndpoints([{ method: "GET", path: "/cdn", statusCode: 200, responseTime: 5, attributes: { "sentrinel.third_party": true } }])).toHaveLength(0);
+  });
+});
+
+test("the tunnel answers on both the new and the old path", async () => {
+  const { isSentrinelTunnelPath } = await import("../src/tunnel");
+  expect(isSentrinelTunnelPath("/api/sentrinel")).toBe(true);
+  expect(isSentrinelTunnelPath("/api/_sentrinel")).toBe(true);
+  expect(isSentrinelTunnelPath("/api/sentrinel/")).toBe(true);
+  expect(isSentrinelTunnelPath("/api/other")).toBe(false);
+});
+
 // ─── Tunnel ─────────────────────────────────────────────────────────────────
 
 describe("tunnel", () => {
@@ -420,51 +624,38 @@ describe("tunnel", () => {
 
     expect(res.status).toBe(202);
     // `accepted` counts the records the page sent, not the requests made of
-    // the API — the rollup below is derived from those same records, and
-    // counting it again would report more than arrived.
+    // the API.
     expect(await res.json()).toEqual({ accepted: 3 });
     expect(captured.map((c) => c.url).sort()).toEqual([
       "https://api.sentrinel.dev/api/ingest/errors",
-      // Derived from `requests`, not sent by the page. Without it the Apps
-      // page reads zero for a site that is reporting correctly.
-      "https://api.sentrinel.dev/api/ingest/metrics",
       "https://api.sentrinel.dev/api/ingest/requests",
       "https://api.sentrinel.dev/api/ingest/sessions",
     ]);
     expect(captured.every((c) => c.key === "snt_live_secret")).toBe(true);
+    // The browser is its own module of the app, whatever key the tunnel holds.
+    expect(captured.every((c) => c.body.module === "web")).toBe(true);
   });
 
-  // The bug this guards against: for months the browser SDK sent per-request
-  // rows and nothing else, so Request logs had data while Overview, Traffic,
-  // Performance and the Apps card all read zero. Both shapes, or the feature
-  // is invisible on the screen people check first.
-  test("browser requests also produce the per-endpoint rollup", async () => {
+  // Browser timings used to be rolled up into /api/ingest/metrics, landing in
+  // the same endpoint rows as the backend's — every call counted twice, and a
+  // p95 that blended the network into the server's number.
+  test("browser timings never reach the backend's endpoint rollup; rows are marked client", async () => {
     const tunnel = createSentrinelTunnel(opts);
     await tunnel(
       post({
         requests: [
           { id: "r1", method: "GET", path: "/api/x", statusCode: 200, responseTime: 10 },
           { id: "r2", method: "GET", path: "/api/x", statusCode: 500, responseTime: 30 },
-          { id: "r3", method: "POST", path: "/api/y", statusCode: 201, responseTime: 20 },
         ],
       })
     );
 
-    const metrics = captured.find((c) => c.url.endsWith("/api/ingest/metrics"))!;
-    expect(metrics).toBeDefined();
-
-    const endpoints = metrics.body.endpoints as any[];
-    expect(endpoints).toHaveLength(2);
-
-    const getX = endpoints.find((e) => e.method === "GET" && e.path === "/api/x")!;
-    expect(getX.requestCount).toBe(2);
-    expect(getX.errorCount).toBe(1);
-    expect(getX.successCount).toBe(1);
-    expect(getX.statusCodes).toEqual({ "200": 1, "500": 1 });
-    expect(getX.avgResponseTime).toBe(20);
+    expect(captured.find((c) => c.url.endsWith("/api/ingest/metrics"))).toBeUndefined();
+    const rows = captured.find((c) => c.url.endsWith("/api/ingest/requests"))!.body.requests as any[];
+    expect(rows.every((r) => r.kind === "client" && r.attributes["sentrinel.kind"] === "client")).toBe(true);
   });
 
-  test("the rollup credits the server-resolved consumer, not the page's claim", async () => {
+  test("request rows credit the server-resolved consumer, not the page's claim", async () => {
     // Same rule as sessions: a page can assert any identity, so the tunnel's
     // own answer has to win here too or the Consumers table is forgeable.
     const tunnel = createSentrinelTunnel({
@@ -489,10 +680,9 @@ describe("tunnel", () => {
       )
     );
 
-    const metrics = captured.find((c) => c.url.endsWith("/api/ingest/metrics"))!;
-    const consumers = metrics.body.consumers as any[];
-    expect(consumers).toHaveLength(1);
-    expect(consumers[0].identifier).toBe("real-user-42");
+    const rows = captured.find((c) => c.url.endsWith("/api/ingest/requests"))!.body.requests as any[];
+    expect(rows).toHaveLength(1);
+    expect(rows[0].consumerIdentifier).toBe("real-user-42");
   });
 
   test("a call the page propagated becomes the client span its trace starts with", async () => {
@@ -510,11 +700,14 @@ describe("tunnel", () => {
       })
     );
 
-    const traces = captured.filter((c) => c.url.endsWith("/api/ingest/traces"));
+    // One batched call, however many spans.
+    const calls = captured.filter((c) => c.url.endsWith("/api/ingest/traces"));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].body.appName).toBe("admin");
+    const traces = calls[0].body.traces as any[];
     expect(traces).toHaveLength(1);
-    expect(traces[0].body.traceId).toBe(traceId);
-    expect(traces[0].body.appName).toBe("admin");
-    const [span] = traces[0].body.spans as any[];
+    expect(traces[0].traceId).toBe(traceId);
+    const [span] = traces[0].spans as any[];
     // The id the backend's span names as its parent, or the two never join.
     expect(span.id).toBe("b".repeat(16));
     expect(span.kind).toBe("CLIENT");

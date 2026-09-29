@@ -106,6 +106,10 @@ class Config:
 
     #: Called with the request; returns the identifier, or None for anonymous.
     consumer_identifier: Callable[[Any], str | None] | None = None
+    #: Take any ``x-sentrinel-consumer`` a client sends, not only a ``guest:``
+    #: id. Off because the header is the caller's to write: trusted, it lets a
+    #: client file its requests under any user it likes.
+    trust_client_consumer: bool = False
 
     @property
     def configured(self) -> bool:
@@ -140,7 +144,8 @@ SETTING_KEYS: frozenset[str] = frozenset(
     """SERVER_URL APP_NAME MODULE TUNNEL_MODULE ENV API_KEY VERSION ENABLED DEBUG
     FLUSH_INTERVAL MAX_BUFFER TIMEOUT CAPTURE_REQUESTS CAPTURE_ERRORS CAPTURE_LOGS
     SAMPLE_RATE SLOW_REQUEST_MS LOG_REQUEST_HEADERS LOG_REQUEST_BODY LOG_RESPONSE_BODY
-    MAX_BODY_BYTES EXCLUDE_PATHS MASK_HEADERS MASK_FIELDS CONSUMER_IDENTIFIER""".split()
+    MAX_BODY_BYTES EXCLUDE_PATHS MASK_HEADERS MASK_FIELDS CONSUMER_IDENTIFIER
+    TRUST_CLIENT_CONSUMER""".split()
 )
 
 
@@ -196,5 +201,8 @@ def load(settings_dict: dict[str, Any] | None = None) -> Config:
     cfg.mask_fields = _compile(DEFAULT_MASK_FIELDS) + _compile(_as_sequence(raw.get("MASK_FIELDS"), ()))
 
     cfg.consumer_identifier = _resolve_callable(raw.get("CONSUMER_IDENTIFIER"))
+    # Only a real True: this one widens what a client may claim, so a string
+    # "False" read from somewhere must not switch it on the way bool() would.
+    cfg.trust_client_consumer = raw.get("TRUST_CLIENT_CONSUMER") is True
     return cfg
 

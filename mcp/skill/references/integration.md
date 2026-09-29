@@ -18,10 +18,12 @@ Two rules hold for every platform:
 
 ## JavaScript and TypeScript
 
-Installed from the public repo — not npm:
+Installed from the public repo — not npm. It ships built JavaScript, so plain
+Node (`import` or `require()`) works as well as Bun, and Elysia is optional:
 
 ```bash
 bun add "@sentrinel/plugin@github:Zaga-ltd/sentinel_packages"
+npm install "github:Zaga-ltd/sentinel_packages"
 ```
 
 Elysia:
@@ -39,13 +41,27 @@ new Elysia().use(
 );
 ```
 
-Express, Next.js and Bun are the same options behind a different entry point —
-`@sentrinel/plugin/express` (`sentrinelExpressMiddleware`),
-`@sentrinel/plugin/next` (`sentrinelNextMiddleware`, and `withSentrinel` for
-`next.config`), `@sentrinel/plugin/bun` (`sentrinelBunMiddleware`).
+Express, Next.js and Bun take the same options behind a different entry point:
+
+- `@sentrinel/plugin/express` — `app.use(sentrinelExpressMiddleware({...}))`
+  before the routes **and** `app.use(sentrinelErrorHandler())` after them.
+  Express hands thrown errors only to error middleware; without it errors
+  arrive with no stack trace.
+- `@sentrinel/plugin/next` — wraps **route handlers**, not `next.config` and
+  not middleware: `const { withSentrinel } = createSentrinelNext({...})` in a
+  shared module, then `export const GET = withSentrinel(async (req, ctx) => …)`
+  (App Router) or `export default withSentrinel((req, res) => …)` (Pages API).
+  Node runtime only. `sentrinelNextMiddleware` records nothing — it is a
+  pass-through kept for old `middleware.ts` files; do not add it.
+- `@sentrinel/plugin/bun` — `fetch: sentrinelBunMiddleware(options, handler)`.
 
 Request logging is sampled; errors and slow requests are always kept. Bodies
-are off until you turn them on, and sensitive headers are masked either way.
+are off until you turn them on. Credentials — `Authorization`, cookies,
+`X-API-Key`, `token`/`code`/`api_key` query values, `password`/`secret`/token
+body fields — are masked by a built-in list that always applies; `maskHeaders`,
+`maskQueryParams` and `maskBodyFields` only **add** to it. Buffers flush on
+SIGTERM/SIGINT, and uncaught exceptions are reported (`processHooks`, on by
+default).
 
 → <https://docs.sentrinel.dev/reference/plugin/> and
 <https://docs.sentrinel.dev/reference/config/>
@@ -57,10 +73,12 @@ on your server forwards it with the key attached:
 
 ```ts
 import { initSentrinelBrowser } from "@sentrinel/plugin/browser";
-initSentrinelBrowser({ endpoint: "/api/sentrinel", release: "2026.8.2" });
+const sentrinel = initSentrinelBrowser({ release: "2026.8.2" }); // posts to /api/sentrinel
+sentrinel.identify(user.id); // until then: guest:<device id>
 ```
 
 ```ts
+// Next: app/api/sentrinel/route.ts — never app/api/_sentrinel (private folder, not routed)
 import { createSentrinelTunnel } from "@sentrinel/plugin/tunnel";
 export const POST = createSentrinelTunnel({
   serverUrl: "https://api.sentrinel.dev",
@@ -71,7 +89,8 @@ export const POST = createSentrinelTunnel({
 ```
 
 If you are about to put a key in client-side code, stop: that is what the
-tunnel exists to avoid.
+tunnel exists to avoid. Import from `@sentrinel/plugin/browser` in a page —
+never from the package root, which is server code.
 
 → <https://docs.sentrinel.dev/reference/browser/>
 
@@ -101,6 +120,12 @@ which many slim Python images lack.
 
 Logs arrive correlated with their request by adding
 `sentrinel_django.SentrinelLogHandler` to `LOGGING`.
+
+A request that neither `CONSUMER_IDENTIFIER` nor `request.user` names is filed
+under the `x-sentrinel-consumer` header the phone and browser SDKs send —
+`guest:` ids only, unless `TRUST_CLIENT_CONSUMER` is `True` — and their
+`x-sentrinel-device` header becomes the `device.id` attribute. FastAPI does the
+same (`trust_client_consumer=True`).
 
 → <https://docs.sentrinel.dev/reference/django/>
 
@@ -190,7 +215,10 @@ curl -fsSL https://sentrinel.dev/install-collector.sh | sudo bash
 ```
 
 `pg_stat_statements` is what makes per-query aggregates possible; without it
-you still get activity, waits, blocking and table stats.
+you still get activity, waits, blocking and table stats. The role needs
+`pg_monitor`; query plans also need `pg_read_all_data` (Postgres 14+), and are
+off, with a note at startup, without it. Query and error text are masked on the
+database host unless `SENTRINEL_MASK_QUERIES=false`.
 
 → <https://docs.sentrinel.dev/reference/database/>
 

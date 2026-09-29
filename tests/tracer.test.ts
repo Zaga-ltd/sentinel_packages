@@ -10,6 +10,7 @@ import {
   generateUuidV7,
   parseTraceParent,
   createClientTracer,
+  sentrinelFetch,
   type TraceContext,
 } from "../src/tracer";
 
@@ -178,5 +179,76 @@ describe("traceSpan call shapes", () => {
     await expect(
       traceStorage.run(ctx, () => traceSpan("broken", { kind: "CLIENT" } as any, undefined as any))
     ).rejects.toThrow(/needs a function to run/);
+  });
+});
+
+// Concurrency. The parent used to be tracked by mutating one shared
+// `currentSpanId`, so whichever of two concurrent spans started second became
+// the child of the first.
+describe("spans under concurrency", () => {
+  const ctx = () => ({ traceId: "c".repeat(32), rootSpanId: "r", currentSpanId: "r", spans: [] as any[] });
+
+  test("Promise.all siblings are siblings", async () => {
+    const context = ctx();
+    const tick = () => new Promise((r) => setTimeout(r, 5));
+    await traceStorage.run(context, () =>
+      Promise.all([
+        traceSpan("a", async () => {
+          await tick();
+          await traceSpan("a.inner", async () => tick());
+        }),
+        traceSpan("b", async () => tick()),
+      ])
+    );
+    const byName = Object.fromEntries(context.spans.map((s) => [s.name, s]));
+    expect(byName.a.parentId).toBe("r");
+    expect(byName.b.parentId).toBe("r");
+    expect(byName["a.inner"].parentId).toBe(byName.a.id);
+  });
+
+  test("traced() keeps a synchronous function synchronous", () => {
+    const context = ctx();
+    const add = traced("math.add", (a: number, b: number) => a + b);
+    const out = traceStorage.run(context, () => add(2, 3));
+    // A number, not a Promise of one.
+    expect(out).toBe(5);
+    expect(context.spans[0].name).toBe("math.add");
+  });
+
+  test("traceObject() keeps sync methods sync and records a sync throw", () => {
+    const context = ctx();
+    const svc = traceObject(
+      {
+        double: (n: number) => n * 2,
+        fail: (): number => {
+          throw new Error("nope");
+        },
+      },
+      "svc"
+    );
+    traceStorage.run(context, () => {
+      expect(svc.double(4)).toBe(8);
+      expect(() => svc.fail()).toThrow("nope");
+    });
+    expect(context.spans.find((s) => s.name === "svc.fail")?.statusCode).toBe("ERROR");
+  });
+
+  test("sentrinelFetch sends traceparent naming its own client span", async () => {
+    const context = ctx();
+    const original = globalThis.fetch;
+    let sent = null as string | null;
+    globalThis.fetch = (async (_u: any, init: any) => {
+      sent = new Headers(init?.headers).get("traceparent");
+      return new Response("ok");
+    }) as any;
+    try {
+      await traceStorage.run(context, () => sentrinelFetch("https://payments.test/v1/charge?api_key=zz"));
+    } finally {
+      globalThis.fetch = original;
+    }
+    const span = context.spans[0];
+    expect(sent).toBe(`00-${"c".repeat(32)}-${span.id}-01`);
+    expect(span.kind).toBe("CLIENT");
+    expect(span.attributes["http.url"]).toBe("https://payments.test/v1/charge?api_key=***");
   });
 });

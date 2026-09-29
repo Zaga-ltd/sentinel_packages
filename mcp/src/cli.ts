@@ -27,7 +27,7 @@ import { configFromEnv, SentrinelClient } from "./client";
 import { VERSION } from "./version";
 import { applyUpdate, autoUpdate, fetchManifest, isNewer } from "./update";
 import { profilesToMarkdown, useProfile, activeProfile, DEFAULT_PROFILE } from "./profiles";
-import { mergeBlock, planFromArgs } from "./skill";
+import { mergeBlock, planFromArgs, type PlannedFile } from "./skill";
 import {
   issuesToMarkdown,
   issueToMarkdown,
@@ -64,7 +64,9 @@ const USAGE = `sentrinel — Sentrinel for coding agents
   sentrinel skill install                   ~/.claude/skills/sentrinel/   Claude Code & Desktop
   sentrinel skill install --cursor          .cursor/rules/sentrinel.mdc   Cursor
   sentrinel skill install --agents          ./AGENTS.md                   Codex, Copilot, Amp
-  sentrinel skill install --dir <path>      anywhere else
+  sentrinel skill install --windsurf        .windsurf/rules/sentrinel.md  Windsurf
+  sentrinel skill install --zed             ./.rules                      Zed
+  sentrinel skill install --dir <path>      anywhere else (a directory)
 
 Environment: SENTRINEL_API_URL, SENTRINEL_API_KEY (an AI agent key: snt_mcp_… or snt_mcprw_…)`;
 
@@ -73,6 +75,13 @@ export interface Parsed {
   positional: string[];
   flags: Record<string, string | boolean>;
 }
+
+/**
+ * Flags that are switches and never take a value. Without this list
+ * `sentrinel issue --json 5f3ac1` read "5f3ac1" as the value of --json, and
+ * the command failed for want of an id that was right there.
+ */
+const SWITCHES = new Set(["json", "all", "install", "cursor", "agents", "agents-md", "windsurf", "zed", "help"]);
 
 /** Tiny and predictable: --k v, --k=v, and bare --flag. */
 export function parseArgs(argv: string[]): Parsed {
@@ -84,6 +93,8 @@ export function parseArgs(argv: string[]): Parsed {
       const eq = a.indexOf("=");
       if (eq > -1) {
         flags[a.slice(2, eq)] = a.slice(eq + 1);
+      } else if (SWITCHES.has(a.slice(2))) {
+        flags[a.slice(2)] = true;
       } else if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
         flags[a.slice(2)] = argv[++i];
       } else {
@@ -95,6 +106,32 @@ export function parseArgs(argv: string[]): Parsed {
   }
   const [command, ...rest] = positional;
   return { command, positional: rest, flags };
+}
+
+/**
+ * Write what `sentrinel skill install` planned.
+ *
+ * A path component that is a file where a directory belongs — `--dir .rules`
+ * in a repo that already has Zed's single .rules file, say — fails as a bare
+ * ENOTDIR/EEXIST. Turned here into the sentence that says what to type.
+ */
+export async function writePlanned(files: PlannedFile[]): Promise<void> {
+  for (const f of files) {
+    try {
+      await mkdir(dirname(f.path), { recursive: true });
+      const content = f.merge ? mergeBlock(await readFile(f.path, "utf8").catch(() => ""), f.content) : f.content;
+      await writeFile(f.path, content);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code === "ENOTDIR" || code === "EEXIST" || code === "EISDIR") {
+        throw new Error(
+          `Could not write ${f.path}: part of that path is a file where a directory belongs (or the other way round). ` +
+            "--dir takes a directory. For Zed, which reads a single .rules file, use `sentrinel skill install --zed`."
+        );
+      }
+      throw err;
+    }
+  }
 }
 
 const str = (v: string | boolean | undefined) => (typeof v === "string" ? v : undefined);
@@ -231,14 +268,7 @@ if (import.meta.main) {
       const { command, positional, flags } = parseArgs(process.argv.slice(3));
       const words = command ? [command, ...positional] : positional;
       const { print, files } = planFromArgs(words, flags, { home: homedir(), cwd: process.cwd() });
-      for (const f of files) {
-        await mkdir(dirname(f.path), { recursive: true });
-        // AGENTS.md belongs to whoever wrote it; merge into our own block.
-        const content = f.path.endsWith("AGENTS.md")
-          ? mergeBlock(await readFile(f.path, "utf8").catch(() => ""), f.content)
-          : f.content;
-        await writeFile(f.path, content);
-      }
+      await writePlanned(files);
       process.stdout.write(print + "\n");
       process.exit(0);
     }
@@ -254,14 +284,19 @@ if (import.meta.main) {
     const client = new SentrinelClient(configFromEnv());
     const text = await run(process.argv.slice(2), client);
     process.stdout.write(text + "\n");
-
-    // After the answer, never before it: a check that delayed the output would
-    // be a tax on every command. The notice goes to stderr so piping the
-    // result into a prompt stays clean.
-    const note = await autoUpdate();
-    if (note) process.stderr.write(note + "\n");
   } catch (err) {
     console.error(`sentrinel: ${err instanceof Error ? err.message : err}`);
     process.exit(1);
+  }
+
+  // After the answer, never before it: a check that delayed the output would
+  // be a tax on every command. And outside the try above — the command has
+  // already succeeded, and nothing the updater does may turn that into exit 1.
+  // The notice goes to stderr so piping the result into a prompt stays clean.
+  try {
+    const note = await autoUpdate();
+    if (note) process.stderr.write(note + "\n");
+  } catch {
+    /* never the user's problem */
   }
 }

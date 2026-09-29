@@ -467,6 +467,112 @@ class TestIdentity:
             SentrinelMiddleware(make_app(), server_url="http://x", app_name="a", api_kye="snt_live_x")
 
 
+class TestClientIdentity:
+    """The phone and browser SDKs name the install in x-sentrinel-consumer and
+    x-sentrinel-device. The server's own idea of who is calling always wins."""
+
+    GUEST = {"x-sentrinel-consumer": "guest:3f9c", "x-sentrinel-device": "3f9c"}
+
+    def _row(self, sent):
+        return sent.rows("/api/ingest/requests", "requests")[0]
+
+    def test_a_guest_header_names_the_consumer_when_nothing_else_does(self, build, sent):
+        client, collector = build(make_app())
+        client.get("/ok", headers=self.GUEST)
+        collector.flush()
+        assert self._row(sent)["consumerIdentifier"] == "guest:3f9c"
+        assert sent.rows("/api/ingest/metrics", "consumers")[0]["identifier"] == "guest:3f9c"
+
+    def test_the_resolver_wins_over_the_header(self, build, sent):
+        client, collector = build(make_app(), consumer_identifier="x-tenant")
+        client.get("/ok", headers={**self.GUEST, "X-Tenant": "acme"})
+        collector.flush()
+        assert self._row(sent)["consumerIdentifier"] == "acme"
+
+    def test_the_signed_in_user_wins_over_the_header(self, build, sent):
+        from starlette.authentication import AuthCredentials, AuthenticationBackend, SimpleUser
+        from starlette.middleware.authentication import AuthenticationMiddleware
+
+        class HeaderAuth(AuthenticationBackend):
+            async def authenticate(self, conn):
+                name = conn.headers.get("x-user")
+                return (AuthCredentials(["authenticated"]), SimpleUser(name)) if name else None
+
+        app = make_app()
+        # Inside this middleware, so the user only exists once the request is
+        # on its way back — after a guest id read at the start would have won.
+        app.add_middleware(AuthenticationMiddleware, backend=HeaderAuth())
+        client, collector = build(app)
+        client.get("/ok", headers={**self.GUEST, "X-User": "ada"})
+        collector.flush()
+        assert self._row(sent)["consumerIdentifier"] == "ada"
+
+    def test_a_header_naming_a_real_user_is_ignored_by_default(self, build, sent):
+        client, collector = build(make_app())
+        client.get("/ok", headers={"x-sentrinel-consumer": "user_7"})
+        client.get("/ok", headers={"x-sentrinel-consumer": "guest:"})
+        collector.flush()
+        assert [r["consumerIdentifier"] for r in sent.rows("/api/ingest/requests", "requests")] == [None, None]
+
+    def test_any_header_is_taken_when_the_client_is_trusted(self, build, sent):
+        client, collector = build(make_app(), trust_client_consumer=True)
+        client.get("/ok", headers={"x-sentrinel-consumer": "user_7"})
+        collector.flush()
+        assert self._row(sent)["consumerIdentifier"] == "user_7"
+
+    def test_the_header_is_bounded(self, build, sent):
+        client, collector = build(make_app())
+        client.get("/ok", headers={"x-sentrinel-consumer": "guest:" + "a" * 500, "x-sentrinel-device": "d" * 500})
+        collector.flush()
+        row = self._row(sent)
+        assert row["consumerIdentifier"] == ("guest:" + "a" * 500)[:255]
+        assert row["attributes"]["device.id"] == "d" * 255
+
+    def test_the_device_is_an_attribute_of_the_request(self, build, sent):
+        client, collector = build(make_app())
+        client.get("/ok", headers=self.GUEST)
+        collector.flush()
+        assert self._row(sent)["attributes"] == {"device.id": "3f9c"}
+
+    def test_no_headers_record_nothing(self, build, sent):
+        client, collector = build(make_app())
+        client.get("/ok", headers={"x-sentrinel-device": ""})
+        collector.flush()
+        row = self._row(sent)
+        assert row["consumerIdentifier"] is None
+        assert "attributes" not in row
+
+    def test_an_exception_belongs_to_the_guest_and_the_device(self, build, sent):
+        client, collector = build(make_app(), raise_server_exceptions=False)
+        client.get("/boom", headers=self.GUEST)
+        collector.flush()
+        err = sent.rows("/api/ingest/errors", "errors")[0]
+        assert err["consumerIdentifier"] == "guest:3f9c"
+        assert err["attributes"] == {"device.id": "3f9c"}
+
+    def test_a_log_line_belongs_to_the_guest(self, build, sent):
+        from sentrinel_fastapi import SentrinelLogHandler
+
+        handler = SentrinelLogHandler()
+        logger = logging.getLogger("shop.cart")
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        app = FastAPI()
+
+        @app.get("/cart")
+        async def cart():
+            logger.info("cart opened")
+            return {}
+
+        try:
+            client, collector = build(app)
+            client.get("/cart", headers=self.GUEST)
+            collector.flush()
+        finally:
+            logger.removeHandler(handler)
+        assert sent.rows("/api/ingest/logs", "logs")[0]["consumerIdentifier"] == "guest:3f9c"
+
+
 class TestLogs:
     def _logger(self):
         from sentrinel_fastapi import SentrinelLogHandler
@@ -688,12 +794,12 @@ class TestTunnel:
         from sentrinel_fastapi import sentrinel_tunnel
 
         app = make_app()
-        app.add_route("/api/_sentrinel", sentrinel_tunnel, methods=["POST", "GET"])
+        app.add_route("/api/sentrinel", sentrinel_tunnel, methods=["POST", "GET"])
         return app
 
     def test_a_batch_is_forwarded_to_the_right_ingest_paths(self, build, sent):
         client, _ = build(self._app())
-        res = client.post("/api/_sentrinel", json={"errors": [{"m": 1}], "requests": [{"p": "/"}]})
+        res = client.post("/api/sentrinel", json={"errors": [{"m": 1}], "requests": [{"p": "/"}]})
         assert res.status_code == 200 and res.json() == {"ok": True, "forwarded": 2}
         paths = [p for p, _ in sent.posts]
         assert "/api/ingest/errors" in paths and "/api/ingest/requests" in paths
@@ -701,7 +807,7 @@ class TestTunnel:
     def test_the_app_and_the_part_come_from_the_server_not_the_batch(self, build, sent):
         client, _ = build(self._app(), module="api")
         client.post(
-            "/api/_sentrinel",
+            "/api/sentrinel",
             json={"errors": [{"m": 1}], "appName": "someone-elses-app", "env": "dev", "module": "api"},
         )
         body = sent.payload("/api/ingest/errors")
@@ -711,7 +817,7 @@ class TestTunnel:
 
     def test_the_tunnel_is_not_recorded_as_a_request_of_this_app(self, build, sent):
         client, collector = build(self._app())
-        client.post("/api/_sentrinel", json={"errors": [{"m": 1}]})
+        client.post("/api/sentrinel", json={"errors": [{"m": 1}]})
         sent.posts.clear()
         collector.flush()
         assert sent.payload("/api/ingest/requests") is None
@@ -719,11 +825,11 @@ class TestTunnel:
 
     def test_junk_is_refused(self, build):
         client, _ = build(self._app())
-        assert client.get("/api/_sentrinel").status_code == 405
-        assert client.post("/api/_sentrinel", content=b"not json").status_code == 400
-        assert client.post("/api/_sentrinel", content=b"[1, 2]").status_code == 400
+        assert client.get("/api/sentrinel").status_code == 405
+        assert client.post("/api/sentrinel", content=b"not json").status_code == 400
+        assert client.post("/api/sentrinel", content=b"[1, 2]").status_code == 400
         big = b'{"errors": [' + b'{"m": 1},' * 250_000 + b'{"m": 1}]}'
-        assert client.post("/api/_sentrinel", content=big).status_code == 413
+        assert client.post("/api/sentrinel", content=big).status_code == 413
 
 
 class TestModule:

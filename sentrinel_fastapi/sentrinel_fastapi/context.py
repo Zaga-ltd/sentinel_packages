@@ -71,3 +71,35 @@ def set_consumer(identifier: str | None) -> None:
     state = _current.get()
     if state is not None:
         state["consumer"] = identifier
+
+
+#: What a phone or browser may name itself as without TRUST_CLIENT_CONSUMER.
+GUEST_PREFIX = "guest:"
+
+#: ``x-sentrinel-consumer`` and ``x-sentrinel-device`` are whatever the caller
+#: chose to send, so they are cut to a length an identifier plausibly has.
+_MAX_CLIENT_ID = 255
+
+
+def client_consumer(value: Any, trust: bool = False) -> str | None:
+    """The consumer a phone or browser named in ``x-sentrinel-consumer``.
+
+    The middleware falls back to it only when the server knows nobody — the
+    resolver and the signed-in user come first. Anyone can send any header, so
+    by default only a ``guest:`` id is taken: it names an install, not an
+    account, and a forged one mislabels anonymous traffic at worst. Any other
+    value, taken on the client's word, would let a caller file its requests and
+    errors under a real user. ``trust`` lifts that for a backend whose callers
+    are its own.
+    """
+    ident = str(value or "").strip()[:_MAX_CLIENT_ID]
+    if not ident:
+        return None
+    if not trust and (not ident.startswith(GUEST_PREFIX) or ident == GUEST_PREFIX):
+        return None
+    return ident
+
+
+def device_id(value: Any) -> str | None:
+    """The install id a phone or browser sent in ``x-sentrinel-device``."""
+    return str(value or "").strip()[:_MAX_CLIENT_ID] or None

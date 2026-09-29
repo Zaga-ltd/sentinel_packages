@@ -14,6 +14,8 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:sentrinel/sentrinel.dart';
 import 'package:sentrinel/src/collector.dart';
+import 'package:sentrinel/src/device_facts.dart';
+import 'package:sentrinel/src/models.dart';
 import 'package:test/test.dart';
 
 /// Captures what the SDK tried to POST, keyed by ingest path.
@@ -137,22 +139,70 @@ void main() {
       expect(captured.byPath['/api/ingest/requests']!.single.containsKey('module'), isFalse);
     });
 
-    test('the outgoing request carries traceparent for the backend to continue', () async {
+    test('a propagation target gets traceparent and the identity headers', () async {
+      Sentrinel.init(
+        serverUrl: 'https://api.test',
+        appName: 'mobile-app',
+        httpClient: captured.client(),
+        tracePropagationTargets: ['example.com'],
+      );
+
+      Map<String, String>? seen;
+      final app = SentrinelHttpClient(MockClient((req) async {
+        seen = req.headers;
+        return http.Response('{}', 200);
+      }));
+      await app.get(Uri.parse('https://api.example.com/v1/orders'));
+
+      expect(seen!['traceparent'], matches(RegExp(r'^00-[0-9a-f]{32}-[0-9a-f]{16}-01$')));
+      // What the backend SDKs read to name the person and the install behind
+      // the request, so a server-side error is filed under the same people.
+      expect(seen!['x-sentrinel-consumer'], 'guest:${Sentrinel.deviceId}');
+      expect(seen!['x-sentrinel-device'], Sentrinel.deviceId);
+    });
+
+    test('a third-party host gets nothing: no trace, no user, no install', () async {
+      // Sending a user id to a payments provider or a maps API was never the
+      // intent, and a traceparent they did not ask for can break a strict
+      // CORS preflight on web.
+      Sentrinel.init(
+        serverUrl: 'https://api.test',
+        appName: 'mobile-app',
+        httpClient: captured.client(),
+        tracePropagationTargets: ['api.mine.com', RegExp(r'^https://internal\.')],
+      );
+
+      Map<String, String>? seen;
+      final app = SentrinelHttpClient(MockClient((req) async {
+        seen = req.headers;
+        return http.Response('{}', 200);
+      }));
+      await app.get(Uri.parse('https://maps.vendor.com/tiles/1'));
+
+      expect(seen!.containsKey('traceparent'), isFalse);
+      expect(seen!.containsKey('x-sentrinel-consumer'), isFalse);
+      expect(seen!.containsKey('x-sentrinel-device'), isFalse);
+
+      // The same host spelled as a suffix match, and a RegExp target.
+      expect(Sentrinel.shouldPropagate(Uri.parse('https://api.mine.com/x')), isTrue);
+      expect(Sentrinel.shouldPropagate(Uri.parse('https://eu.api.mine.com/x')), isTrue);
+      expect(Sentrinel.shouldPropagate(Uri.parse('https://notapi.mine.com.evil.io/x')), isFalse);
+      expect(Sentrinel.shouldPropagate(Uri.parse('https://internal.corp/x')), isTrue);
+    });
+
+    test('with no targets configured, nothing is propagated', () async {
       Sentrinel.init(
         serverUrl: 'https://api.test',
         appName: 'mobile-app',
         httpClient: captured.client(),
       );
-
       String? seen;
       final app = SentrinelHttpClient(MockClient((req) async {
         seen = req.headers['traceparent'];
         return http.Response('{}', 200);
       }));
       await app.get(Uri.parse('https://example.com/v1/orders'));
-
-      expect(seen, isNotNull);
-      expect(seen, matches(RegExp(r'^00-[0-9a-f]{32}-[0-9a-f]{16}-01$')));
+      expect(seen, isNull);
     });
 
     test("an app's own traceparent is not overwritten", () async {
@@ -160,6 +210,7 @@ void main() {
         serverUrl: 'https://api.test',
         appName: 'mobile-app',
         httpClient: captured.client(),
+        tracePropagationTargets: ['example.com'],
       );
 
       const mine = '00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01';
@@ -215,6 +266,78 @@ void main() {
       expect(rows.single['statusCode'], 0);
       expect(rows.single['errorMessage'], contains('offline'));
     });
+
+    test('secrets in the URL never leave the device', () async {
+      Sentrinel.init(
+        serverUrl: 'https://api.test',
+        appName: 'mobile-app',
+        httpClient: captured.client(),
+      );
+
+      final ok = SentrinelHttpClient(MockClient((_) async => http.Response('{}', 200)));
+      await ok.get(Uri.parse('https://bob:hunter2@example.com/v1/login?token=s3cret#frag'));
+      // ClientException.toString() ends in `uri=<the full URL>`.
+      final down = SentrinelHttpClient(MockClient((req) async =>
+          throw http.ClientException('offline', req.url)));
+      await expectLater(
+        down.get(Uri.parse('https://example.com/v1/reset?email=jane@x.io&code=991')),
+        throwsA(isA<http.ClientException>()),
+      );
+      await Sentrinel.flush();
+
+      final everything = jsonEncode(captured.byPath);
+      expect(everything, isNot(contains('s3cret')));
+      expect(everything, isNot(contains('hunter2')));
+      expect(everything, isNot(contains('jane@x.io')));
+      expect(everything, isNot(contains('991')));
+
+      final span = captured.rows('/api/ingest/traces', 'traces').first['spans'][0];
+      expect(span['attributes']['http.url'], 'https://example.com/v1/login');
+    });
+
+    test('an HTTP error is filed under its route, not the raw path', () async {
+      // The server groups errors by endpoint. `/orders/8814` and `/orders/9921`
+      // are one endpoint, and must not become two.
+      Sentrinel.init(
+        serverUrl: 'https://api.test',
+        appName: 'mobile-app',
+        httpClient: captured.client(),
+      );
+      final app = SentrinelHttpClient(MockClient((_) async => http.Response('', 404)));
+      await app.get(Uri.parse('https://example.com/orders/8814'));
+      await Sentrinel.flush();
+
+      final error = captured.rows('/api/ingest/errors', 'errors').single;
+      expect(error['path'], '/orders/{id}');
+      expect(error['attributes']['url.path'], '/orders/8814');
+      final request = captured.rows('/api/ingest/requests', 'requests').single;
+      expect(request['path'], '/orders/8814', reason: 'the row keeps what was requested');
+      expect(request['route'], '/orders/{id}');
+    });
+
+    test('spans leave in one batch, not one request each', () async {
+      Sentrinel.init(
+        serverUrl: 'https://api.test',
+        appName: 'mobile-app',
+        httpClient: captured.client(),
+      );
+      final app = SentrinelHttpClient(MockClient((_) async => http.Response('{}', 200)));
+      for (var i = 0; i < 20; i++) {
+        await app.get(Uri.parse('https://example.com/v1/items/$i'));
+      }
+      await Sentrinel.flush();
+
+      final posts = captured.byPath['/api/ingest/traces']!;
+      expect(posts, hasLength(1));
+      final traces = (posts.single['traces'] as List).cast<Map<String, dynamic>>();
+      expect(traces, hasLength(20));
+      final one = traces.first;
+      expect(one['traceId'], hasLength(32));
+      expect(one['name'], 'GET /v1/items/{id}');
+      expect(one['statusCode'], 200);
+      expect(DateTime.parse(one['startTime'] as String), isA<DateTime>());
+      expect((one['spans'] as List).single['id'], hasLength(16));
+    });
   });
 
   group('context and logs', () {
@@ -239,9 +362,142 @@ void main() {
       expect(logs, hasLength(1));
       expect(logs.single['message'], 'Checkout opened');
       expect(logs.single['category'], 'ui');
-      expect(logs.single['attributes'],
-          {'screen': 'checkout', 'tier': 'pro', 'step': 1});
+      expect(logs.single['attributes'], {
+        'device.id': Sentrinel.deviceId,
+        'screen': 'checkout',
+        'tier': 'pro',
+        'step': 1,
+      });
     });
+
+    test('a value JSON cannot hold does not cost the batch', () async {
+      // A DateTime in one property used to throw inside jsonEncode, and the
+      // catch-all around the post dropped every record that flush carried.
+      Sentrinel.init(
+        serverUrl: 'https://api.test',
+        appName: 'mobile-app',
+        httpClient: captured.client(),
+      );
+      final when = DateTime.utc(2026, 9, 1, 12);
+      Sentrinel.info('with a date', attributes: {'at': when, 'ratio': double.nan});
+      Sentrinel.info('plain');
+      Sentrinel.track('bought', properties: {'at': when, 'tier': _Tier.gold});
+      Sentrinel.addBreadcrumb('crumb', data: {'at': when});
+      Sentrinel.captureError(StateError('x'), null, attributes: {'obj': Object()});
+      await Sentrinel.flush();
+
+      final logs = captured.rows('/api/ingest/logs', 'logs');
+      expect(logs, hasLength(2));
+      expect(logs.first['attributes']['at'], '2026-09-01T12:00:00.000Z');
+      expect(logs.first['attributes']['ratio'], isNull);
+      final events = captured.rows('/api/ingest/events', 'events');
+      expect(events.single['properties'], {'at': '2026-09-01T12:00:00.000Z', 'tier': 'gold'});
+      expect(captured.rows('/api/ingest/errors', 'errors'), hasLength(1));
+    });
+
+    test('beforeSend rewrites or drops any record', () async {
+      Sentrinel.init(
+        serverUrl: 'https://api.test',
+        appName: 'mobile-app',
+        httpClient: captured.client(),
+        beforeSend: (kind, record) {
+          if (kind == 'log' && record['message'] == 'secret') return null;
+          if (kind == 'error') return {...record, 'errorMessage': '[redacted]'};
+          return record;
+        },
+      );
+      Sentrinel.info('secret');
+      Sentrinel.info('fine');
+      Sentrinel.captureError(StateError('card 4242 4242 4242 4242'), null);
+      await Sentrinel.flush();
+
+      expect(captured.rows('/api/ingest/logs', 'logs').map((l) => l['message']), ['fine']);
+      expect(captured.rows('/api/ingest/errors', 'errors').single['errorMessage'], '[redacted]');
+    });
+
+    test('a beforeSend that throws drops the record rather than sending it raw', () async {
+      Sentrinel.init(
+        serverUrl: 'https://api.test',
+        appName: 'mobile-app',
+        httpClient: captured.client(),
+        beforeSend: (kind, record) => throw StateError('bug in the hook'),
+      );
+      Sentrinel.info('would have been filtered');
+      await Sentrinel.flush();
+      expect(captured.rows('/api/ingest/logs', 'logs'), isEmpty);
+    });
+
+    test('the SDK and the device travel with the batch', () async {
+      Sentrinel.init(
+        serverUrl: 'https://api.test',
+        appName: 'mobile-app',
+        httpClient: captured.client(),
+      );
+      Sentrinel.setDeviceInfo(model: 'Pixel 8', osVersion: '14', deviceType: 'mobile');
+      Sentrinel.track('opened');
+      Sentrinel.info('x');
+      await Sentrinel.flush();
+
+      final events = captured.byPath['/api/ingest/events']!.single;
+      expect(events['deviceModel'], 'Pixel 8');
+      expect(events['osVersion'], '14');
+      expect(events['deviceType'], 'mobile');
+      expect(events['os'], isNotNull);
+      final logs = captured.byPath['/api/ingest/logs']!.single;
+      expect(logs['sdk'], {'name': 'sentrinel.dart', 'version': kSdkVersion});
+    });
+  });
+
+  group('the User-Agent reads as the device it came from', () {
+    // `Dart/3.x (dart:io)` parsed as an unknown desktop on the server, so every
+    // Flutter event landed in the desktop segment.
+    test('android and iOS phones and tablets', () {
+      expect(
+        sdkUserAgent(const DeviceFacts(os: 'Android', osVersion: '14', deviceType: 'mobile')),
+        'sentrinel.dart/$kSdkVersion (Android 14; Mobile)',
+      );
+      expect(
+        sdkUserAgent(const DeviceFacts(os: 'Android', deviceType: 'tablet')),
+        'sentrinel.dart/$kSdkVersion (Android; Tablet)',
+      );
+      expect(
+        sdkUserAgent(const DeviceFacts(os: 'iOS', osVersion: '17.4', deviceType: 'mobile')),
+        'sentrinel.dart/$kSdkVersion (iOS 17.4; iPhone)',
+      );
+      expect(
+        sdkUserAgent(const DeviceFacts(os: 'iOS', osVersion: '17.4', deviceType: 'tablet')),
+        'sentrinel.dart/$kSdkVersion (iOS 17.4; iPad)',
+      );
+    });
+
+    test('the OS version is the OS, not the kernel', () {
+      expect(cleanOsVersion('ios', 'Version 17.4 (Build 21E213)'), '17.4');
+      expect(cleanOsVersion('macos', 'Version 14.4.1 (Build 23E224)'), '14.4.1');
+      // dart:io on Android reports the Linux kernel; "Android 5.10" would lie.
+      expect(cleanOsVersion('android', 'Linux 5.10.198-android13-4 #1 SMP'), isNull);
+    });
+
+    test('is sent on every telemetry post', () async {
+      String? ua;
+      Sentrinel.init(
+        serverUrl: 'https://api.test',
+        appName: 'mobile-app',
+        httpClient: MockClient((req) async {
+          ua = req.headers['user-agent'];
+          return http.Response('{}', 200);
+        }),
+      );
+      Sentrinel.info('x');
+      await Sentrinel.flush();
+      await Sentrinel.close();
+      expect(ua, startsWith('sentrinel.dart/$kSdkVersion ('));
+    });
+  });
+
+  group('captured errors', () {
+    late Captured captured;
+    setUp(() => captured = Captured());
+    tearDown(() async => Sentrinel.close());
 
     test('captureError records the type and the stack', () async {
       Sentrinel.init(
@@ -303,6 +559,86 @@ void main() {
       expect(collector.droppedRecords, 40);
       collector.dispose();
     });
+
+    test('a full replay buffer keeps the newest record', () async {
+      // It used to drop the oldest *and* return without adding the new one.
+      final captured = Captured();
+      final collector = SentrinelCollector(
+        serverUrl: 'https://api.test',
+        appName: 'a',
+        env: 'test',
+        apiKey: null,
+        client: captured.client(),
+      );
+      for (var i = 0; i <= kMaxBufferedErrors; i++) {
+        collector.recordRaw('error', {'method': 'APP', 'path': 'app', 'errorMessage': 'n$i'});
+      }
+      await collector.flush();
+      final messages = captured.rows('/api/ingest/errors', 'errors').map((e) => e['errorMessage']);
+      expect(messages, contains('n$kMaxBufferedErrors'));
+      expect(messages, isNot(contains('n0')));
+      collector.dispose();
+    });
+
+    test('initialising again sends what the first one buffered', () async {
+      final first = Captured();
+      Sentrinel.init(serverUrl: 'https://api.test', appName: 'a', httpClient: first.client());
+      Sentrinel.info('buffered before re-init');
+      Sentrinel.init(serverUrl: 'https://api.test', appName: 'a', httpClient: Captured().client());
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+
+      expect(first.rows('/api/ingest/logs', 'logs').map((l) => l['message']),
+          contains('buffered before re-init'));
+    });
+
+    test("a client the app passed in is not closed by Sentrinel", () async {
+      var closed = false;
+      final mine = _CloseTracking(() => closed = true);
+      Sentrinel.init(serverUrl: 'https://api.test', appName: 'a', httpClient: mine);
+      Sentrinel.init(serverUrl: 'https://api.test', appName: 'a', httpClient: mine);
+      await Sentrinel.close();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(closed, isFalse);
+    });
+
+    test('close twice is harmless', () async {
+      Sentrinel.init(serverUrl: 'https://api.test', appName: 'a', httpClient: Captured().client());
+      await Sentrinel.close();
+      await expectLater(Sentrinel.close(), completes);
+    });
+
+    test('never more than four posts in flight', () async {
+      var active = 0;
+      var peak = 0;
+      final collector = SentrinelCollector(
+        serverUrl: 'https://api.test',
+        appName: 'a',
+        env: 'test',
+        apiKey: null,
+        client: MockClient((_) async {
+          active++;
+          if (active > peak) peak = active;
+          await Future<void>.delayed(const Duration(milliseconds: 10));
+          active--;
+          return http.Response('{}', 200);
+        }),
+      );
+      // Requests + metrics + errors + logs + spans + events + sessions + custom
+      // metrics: eight endpoints in one flush.
+      collector.anonymousId = 'anon';
+      collector.recordRequest(RequestRecord(
+          id: 'r', method: 'GET', path: '/x', statusCode: 500, responseTime: 1, timestamp: DateTime.now()));
+      collector.recordError(ErrorRecord(method: 'GET', path: '/x', statusCode: 500, timestamp: DateTime.now()));
+      collector.recordLog(LogRecord(level: 'info', message: 'm', timestamp: DateTime.now()));
+      collector.recordSpan(SpanRecord(
+          id: 's', traceId: 't' * 32, name: 'n', startTime: DateTime.now(), durationMs: 1));
+      collector.recordEvent(EventRecord(name: 'e'));
+      collector.recordSession(SessionRecord(sessionId: 's', status: 'ok', startedAt: DateTime.now()));
+      collector.metrics.record('m', 'counter', 1);
+      await collector.flush();
+      expect(peak, lessThanOrEqualTo(kMaxConcurrentPosts));
+      collector.dispose();
+    });
   });
 
   // The dashboard reads two different things from one flush: the request rows
@@ -356,6 +692,28 @@ void main() {
         isNotNull,
         reason: 'without this the Apps page reads zero for a working app',
       );
+    });
+
+    test('ids in the path fold into one route row', () async {
+      // Grouped by raw path, `/orders/1` and `/orders/2` were two rows that the
+      // server then normalised onto the same endpoint.
+      final captured = await flushRequests([
+        req(path: '/api/v1/orders/8814'),
+        req(path: '/api/v1/orders/9921'),
+        req(path: '/api/v1/orders/5a89df16-88a6-462d-89d9-828207ea459f', consumer: 'u1'),
+        req(path: '/api/v1/orders/5a89df16-88a6-462d-89d9-828207ea4000', consumer: 'u1'),
+      ]);
+
+      final endpoints = captured.rows('/api/ingest/metrics', 'endpoints');
+      expect(endpoints.map((e) => e['path']).toSet(),
+          {'/api/v1/orders/{id}', '/api/v1/orders/{uuid}'});
+      expect(endpoints.firstWhere((e) => e['path'] == '/api/v1/orders/{id}')['requestCount'], 2);
+      final consumers = captured.rows('/api/ingest/metrics', 'consumers');
+      expect(consumers.single['path'], '/api/v1/orders/{uuid}');
+      expect(consumers.single['requestCount'], 2);
+      // No deploy marker from a phone: mixed releases in the field would flip
+      // it on every flush.
+      expect(captured.byPath['/api/ingest/metrics']!.single.containsKey('version'), isFalse);
     });
 
     test('requests are grouped by method and path', () async {
@@ -457,24 +815,24 @@ void main() {
 
   group('who the traffic belongs to', () {
     // The Consumers page listed "mobile_android" and "mobile_ios" and no
-    // people. consumerIdentifier was fixed at init() with no way to change it,
-    // and identify() only moved the *event* identity — so requests, logs and
-    // errors stayed filed under whatever init() was given.
+    // people: signed-out traffic was filed under init's consumerIdentifier, so
+    // every signed-out user on a platform was one consumer. Each install is
+    // its own guest now, and identify() moves it to the person.
     setUp(() {
       Sentrinel.init(
         serverUrl: 'http://localhost:9',
         appName: 'test',
         env: 'test',
         apiKey: 'k',
-        consumerIdentifier: 'mobile_android',
         persistCrashes: false,
       );
     });
 
     tearDown(Sentrinel.close);
 
-    test('starts as whatever init was given', () {
-      expect(Sentrinel.consumer, 'mobile_android');
+    test('a signed-out install is its own guest', () {
+      expect(Sentrinel.deviceId, hasLength(32));
+      expect(Sentrinel.consumer, 'guest:${Sentrinel.deviceId}');
     });
 
     test('identifying a user attributes their traffic to them', () {
@@ -483,24 +841,79 @@ void main() {
       expect(Sentrinel.currentUserId, 'user_42');
     });
 
-    test('signing out falls back to the init value, not to nobody', () {
+    test('signing out returns to this install, not to a shared bucket', () {
       Sentrinel.identify('user_42');
       Sentrinel.identify(null);
-      expect(Sentrinel.consumer, 'mobile_android');
+      expect(Sentrinel.consumer, 'guest:${Sentrinel.deviceId}');
       expect(Sentrinel.currentUserId, isNull);
     });
 
     test('a blank id is not an identity', () {
       Sentrinel.identify('   ');
-      expect(Sentrinel.consumer, 'mobile_android');
+      expect(Sentrinel.consumer, 'guest:${Sentrinel.deviceId}');
       expect(Sentrinel.currentUserId, isNull);
     });
 
-    test('setConsumer names something that is not the signed-in user', () {
+    test('setConsumer pins something that is not the signed-in user', () {
+      Sentrinel.identify('user_42');
       Sentrinel.setConsumer('tenant_7');
       expect(Sentrinel.consumer, 'tenant_7');
       Sentrinel.setConsumer(null);
-      expect(Sentrinel.consumer, 'mobile_android');
+      expect(Sentrinel.consumer, 'user_42');
+    });
+
+    test("init's consumerIdentifier is an override until identify", () async {
+      Sentrinel.init(
+        serverUrl: 'http://localhost:9',
+        appName: 'test',
+        env: 'test',
+        consumerIdentifier: 'kiosk_3',
+        persistCrashes: false,
+      );
+      expect(Sentrinel.consumer, 'kiosk_3');
+      Sentrinel.identify('user_42');
+      expect(Sentrinel.consumer, 'user_42');
+      Sentrinel.identify(null);
+      expect(Sentrinel.consumer, 'guest:${Sentrinel.deviceId}');
+    });
+
+    test('every record carries the install id', () async {
+      final captured = Captured();
+      Sentrinel.init(
+        serverUrl: 'https://api.test',
+        appName: 'test',
+        httpClient: captured.client(),
+        persistCrashes: false,
+      );
+      final app = SentrinelHttpClient(MockClient((_) async => http.Response('', 500)));
+      await app.get(Uri.parse('https://example.com/x'));
+      Sentrinel.info('x');
+      Sentrinel.captureError(StateError('e'), null);
+      await Sentrinel.flush();
+
+      final id = Sentrinel.deviceId;
+      expect(captured.rows('/api/ingest/requests', 'requests').single['attributes']['device.id'], id);
+      expect(captured.rows('/api/ingest/logs', 'logs').single['attributes']['device.id'], id);
+      for (final e in captured.rows('/api/ingest/errors', 'errors')) {
+        expect(e['attributes']['device.id'], id);
+        expect(e['consumerIdentifier'], 'guest:$id');
+      }
+      final span = captured.rows('/api/ingest/traces', 'traces').single['spans'][0];
+      expect(span['attributes']['device.id'], id);
     });
   });
+}
+
+enum _Tier { gold }
+
+class _CloseTracking extends http.BaseClient {
+  _CloseTracking(this.onClose);
+  final void Function() onClose;
+  final _inner = MockClient((_) async => http.Response('{}', 200));
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) => _inner.send(request);
+
+  @override
+  void close() => onClose();
 }

@@ -75,21 +75,82 @@ export interface SentrinelPluginOptions {
     | ((ctx: any) => string | ConsumerIdentity | null | undefined);
 
   /**
+   * Which `x-sentrinel-consumer` values to trust when `consumerIdentifier`
+   * resolves nothing.
+   *
+   * The browser SDK sends that header on same-origin calls — `guest:<device>`
+   * for a signed-out visitor, the identified user otherwise. `guest:` values
+   * are always accepted: they name a device, not a person, so claiming one
+   * impersonates nobody. Anything else is a claim a page makes about itself,
+   * and is accepted only when it matches this pattern. Leave it unset unless
+   * the values it admits are harmless to spoof.
+   */
+  consumerHeaderPattern?: RegExp;
+
+  /**
    * What to do when a batch cannot be delivered.
    *
    * Failed payloads are held and re-sent with exponential backoff rather than
    * discarded. Only failures retrying can fix are kept — a 401 or a 422 is
    * dropped at once, because it would fail identically forever and would only
-   * crowd out payloads that could still land.
+   * crowd out payloads that could still land. Each payload type has its own
+   * queue, so an outage full of request logs cannot evict metrics.
    */
   retry?: {
-    /** Payloads held at once; past this the oldest is dropped. Default 100. */
+    /** Payloads held at once, per payload type; past this the oldest is dropped. Default 100. */
     maxQueued?: number;
+    /** Serialized bytes held at once, per payload type. Default 8MB. */
+    maxQueuedBytes?: number;
     /** Attempts per payload before giving up. Default 5. */
     maxAttempts?: number;
     /** First backoff step in ms; doubles each attempt. Default 5000. */
     baseDelayMs?: number;
   };
+
+  /**
+   * How long one POST to Sentrinel may take before it is abandoned (and
+   * retried). Default 10000. Without a limit a hung connection held its batch
+   * — and every later flush — indefinitely.
+   */
+  sendTimeoutMs?: number;
+
+  /**
+   * Records held between flushes, per type. Past a limit the oldest are
+   * dropped and the count is reported once per flush. Metrics are aggregated
+   * rather than buffered, so they are exact whatever these are.
+   */
+  buffer?: {
+    /** Default 10000. */
+    maxRequestLogs?: number;
+    /** Default 10000. */
+    maxAppLogs?: number;
+    /** Default 5000. */
+    maxErrors?: number;
+    /** Default 5000. */
+    maxTraces?: number;
+  };
+
+  /**
+   * Process-level hooks, on by default (off when `NODE_ENV` is `test`).
+   *
+   * - `flushOnExit`: on SIGTERM, SIGINT and `beforeExit`, flush what is
+   *   buffered — waiting at most `timeoutMs` — before the process goes. The
+   *   signal's default behaviour (exiting) is preserved when nothing else
+   *   handles it.
+   * - `captureErrors`: report `uncaughtException` and `unhandledRejection`,
+   *   flush, then behave as Node would have without the hook (print and exit
+   *   with code 1), unless your app has its own handlers, which then decide.
+   *
+   * `false` turns both off.
+   */
+  processHooks?:
+    | boolean
+    | {
+        flushOnExit?: boolean;
+        captureErrors?: boolean;
+        /** Longest wait for the final flush, in ms. Default 3000. */
+        timeoutMs?: number;
+      };
 
   /** Paths to exclude from monitoring (regex patterns) */
   excludePaths?: (string | RegExp)[];
@@ -138,16 +199,34 @@ export interface RequestLoggingOptions {
   /** Log response body (default: false) */
   logResponseBody?: boolean;
 
-  /** Max body size to log in bytes (default: 64KB) */
+  /**
+   * Max body size to log in bytes (default: 64KB). Bodies are read only up to
+   * this — the rest of the stream is never buffered for logging.
+   */
   maxBodySize?: number;
 
-  /** Query parameters to mask (replaced with "***") */
+  /**
+   * Extra query parameters to mask (replaced with "***"). Added to a built-in
+   * list that always applies: token, key, api_key, code, password, signature,
+   * access_token and anything ending in `token`/`signature` or containing
+   * `secret`/`password`/`credential`.
+   */
   maskQueryParams?: (string | RegExp)[];
 
-  /** Headers to mask */
+  /**
+   * Extra headers to mask. Added to a built-in list that always applies:
+   * authorization, proxy-authorization, cookie, set-cookie, x-api-key,
+   * x-auth-token and anything ending in `token` or containing `secret`,
+   * `password` or `api-key`.
+   */
   maskHeaders?: (string | RegExp)[];
 
-  /** Body fields to mask (supports nested paths) */
+  /**
+   * Extra body fields to mask, at any depth, in JSON, form-encoded and
+   * multipart bodies. Added to a built-in list that always applies: password,
+   * passwd, secret, token (and `*_token`/`*Token`), api_key/apikey,
+   * authorization, credit card number fields, cvv/cvc, pin, ssn.
+   */
   maskBodyFields?: (string | RegExp)[];
 }
 
@@ -159,7 +238,16 @@ export interface EndpointMetrics {
   requestCount: number;
   successCount: number;
   errorCount: number;
+  /**
+   * A bounded reservoir sample, for percentiles. Count, sum, min and max are
+   * kept exactly alongside it, so only the percentiles are estimates — and
+   * only once an endpoint has served more requests in a window than the
+   * reservoir holds.
+   */
   responseTimes: number[];
+  totalResponseTime: number;
+  minResponseTime: number;
+  maxResponseTime: number;
   statusCodes: Record<string, number>;
   totalRequestSize: number;
   totalResponseSize: number;
@@ -331,6 +419,25 @@ export interface ErrorPayload {
     /** Business context attached with addRequestContext(). */
     attributes?: Record<string, unknown>;
   }[];
+}
+
+/** One trace as it travels in a `POST /api/ingest/traces` batch. */
+export interface TraceRecord {
+  traceId: string;
+  requestLogId?: string;
+  name: string;
+  startTime: string;
+  endTime?: string;
+  durationMs: number;
+  statusCode?: number | string;
+  spans: object[];
+}
+
+export interface TracesPayload {
+  appName: string;
+  module?: string;
+  env: string;
+  traces: TraceRecord[];
 }
 
 /**

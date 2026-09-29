@@ -53,7 +53,7 @@ The output is designed to be piped into a prompt:
 ```bash
 sentrinel issue 5f3ac1 | claude -p "Find the cause of this in the current repo and fix it."
 sentrinel issues --sort users --json | jq -r '.issues[0].id'
-sentrinel logs --level error --json | jq '.logs[] | {msg, requestId}'
+sentrinel logs --level error --json | jq '.logs[] | {message, requestId}'
 ```
 
 A useful shape for a harness: take one id, pull its request, and hand both to
@@ -61,7 +61,7 @@ the model in the same prompt.
 
 ```bash
 id=$(sentrinel issues --sort users --json | jq -r '.issues[0].id')
-{ sentrinel issue "$id"; sentrinel request "$(sentrinel issue "$id" --json | jq -r '.latest.requestId')"; } \
+{ sentrinel issue "$id"; sentrinel request "$(sentrinel issue "$id" --json | jq -r '.recent[0].requestLogId')"; } \
   | your-agent -p "Fix this in the current repo. Add a test using the captured body."
 ```
 

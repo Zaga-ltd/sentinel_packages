@@ -1,4 +1,4 @@
-// ─── Sentrinel Bun Native Adapter ────────────────────────────────────────────
+// ─── Sentrinel Bun Native Adapter — `@sentrinel/plugin/bun` ──────────────────
 // For Bun.serve() without Elysia. Wraps the fetch handler to record telemetry.
 //
 // Usage:
@@ -10,200 +10,125 @@
 //       return new Response("Hello");
 //     }),
 //   });
+//
+// The handler runs inside the request's trace context, so `traceSpan()` and
+// `getLogger()` attach to this request. Bodies are read only as far as
+// `maxBodySize`, and a response body is read after the response has been
+// handed back — never in the way of it.
 
-import { MetricsCollector } from "./collector";
-import { parseTraceParent, generateTraceId, generateSpanId } from "./tracer";
-import { maskHeaders, maskBodyFields, maskQueryParams, truncateBody } from "./masking";
-import { shouldCaptureLog } from "./sampling";
-import type { SentrinelPluginOptions, RequestLogEntry } from "./types";
-import { resolveConsumer } from "./types";
+import { peekBody, type BoundedText } from "./body";
+import { createServerInstrumentation, errorShape, type RequestOutcome } from "./core";
+import type { SentrinelPluginOptions } from "./types";
 
 type FetchHandler = (req: Request, server: any) => Response | Promise<Response>;
+
+/** Captured for error messages when the body is not being logged. */
+const ERROR_BODY_BYTES = 8 * 1024;
 
 export function sentrinelBunMiddleware(
   options: SentrinelPluginOptions,
   handler: FetchHandler
-): FetchHandler {
-  const collector = new MetricsCollector(options);
-  const excludePatterns = (options.excludePaths || []).map((p) =>
-    typeof p === "string" ? new RegExp(`^${p.replace(/\*/g, ".*")}$`) : p
-  );
-  const maxBodySize = options.requestLogging?.maxBodySize ?? 65_536;
+): FetchHandler & { flush: () => Promise<void>; stop: () => Promise<void> } {
+  const core = createServerInstrumentation(options, "Bun middleware");
+  const logging = options.requestLogging;
+  const logRequestBody = !!(logging?.enabled && logging.logRequestBody);
+  const logResponseBody = !!(logging?.enabled && logging.logResponseBody);
 
-  collector.start();
-  if (options.debug) console.log("[sentrinel] Bun middleware initialized for", options.appName);
-
-  return async function instrumentedFetch(req: Request, server: any): Promise<Response> {
-    const startTime = performance.now();
-    const startISO = new Date().toISOString();
-    const requestLogId = crypto.randomUUID();
-
-    const url = new URL(req.url);
-    const path = url.pathname;
-    const method = req.method.toUpperCase();
-
-    // Check excluded paths
-    if (excludePatterns.some((p) => p.test(path))) {
+  const instrumentedFetch = async function instrumentedFetch(req: Request, server: any): Promise<Response> {
+    let url: URL;
+    try {
+      url = new URL(req.url);
+    } catch {
       return handler(req, server);
     }
 
-    // Trace context
-    const incomingHeader =
-      req.headers.get("traceparent") ||
-      req.headers.get("x-trace-id") ||
-      req.headers.get("x-request-id");
-    const parsedTrace = parseTraceParent(incomingHeader);
-    const traceId = parsedTrace?.traceId || generateTraceId();
-    const spanId = parsedTrace?.parentSpanId || generateSpanId();
-
-    // Consumer identifier
-    let consumerIdentifier: string | null | undefined = null;
-    let consumerName: string | undefined;
-    let consumerGroup: string | undefined;
-    if (typeof options.consumerIdentifier === "function") {
-      try {
-        const r = resolveConsumer(options.consumerIdentifier({ request: req } as any));
-        consumerIdentifier = r.identifier;
-        consumerName = r.name;
-        consumerGroup = r.group;
-      } catch {}
-    } else if (typeof options.consumerIdentifier === "string") {
-      consumerIdentifier = req.headers.get(options.consumerIdentifier.toLowerCase());
+    if (core.isExcludedPath(url.pathname)) return handler(req, server);
+    try {
+      if (options.excludeRequest?.(req)) return handler(req, server);
+    } catch {
+      // A predicate that throws excludes nothing.
     }
 
-    // Capture error
+    const header = (name: string) => req.headers.get(name);
+    const state = core.begin(req.method, url, header);
+
+    // Read before the handler starts pulling the stream — see body.ts.
+    const requestBody: BoundedText | undefined = logRequestBody
+      ? await peekBody(req, core.maxBodySize)
+      : undefined;
+
+    let consumer: any = null;
+    if (typeof options.consumerIdentifier === "function") {
+      try {
+        consumer = options.consumerIdentifier({ request: req });
+      } catch {}
+    } else {
+      consumer = core.consumerFromHeader(header);
+    }
+
+    const requestSize = parseInt(req.headers.get("content-length") || "0", 10) || 0;
+    const base: Omit<RequestOutcome, "statusCode"> = {
+      consumer,
+      requestSize,
+      requestHeaders: () => {
+        const raw: Record<string, string> = {};
+        req.headers.forEach((value, key) => {
+          raw[key] = value;
+        });
+        return raw;
+      },
+      requestBody: requestBody
+        ? {
+            text: requestBody.text,
+            truncated: requestBody.truncated,
+            totalBytes: requestSize || undefined,
+            contentType: req.headers.get("content-type"),
+          }
+        : undefined,
+    };
+
     let response: Response;
-    let capturedError: { name: string; message: string; stack?: string } | undefined;
-
     try {
-      response = await handler(req, server);
+      response = await core.run(state, () => handler(req, server));
     } catch (err) {
-      if (err instanceof Error) {
-        capturedError = { name: err.name, message: err.message, stack: err.stack };
-      }
-      // Re-throw after recording
-      const responseTime = Math.round((performance.now() - startTime) * 100) / 100;
-
-      collector.recordRequest({
-        path,
-        method,
-        statusCode: 500,
-        responseTime,
-        requestSize: parseInt(req.headers.get("content-length") || "0", 10),
-        responseSize: 0,
-        consumerIdentifier,
-        consumerName,
-        consumerGroup,
-      });
-
-      collector.recordError({
-        method,
-        path,
-        statusCode: 500,
-        statusMessage: "Internal Server Error",
-        errorType: capturedError?.name,
-        errorMessage: capturedError?.message,
-        stackTrace: capturedError?.stack,
-        consumerIdentifier,
-        timestamp: startISO,
-        requestLogId,
-        traceId,
-      });
-
+      core.finish(state, { ...base, statusCode: 500, error: errorShape(err) });
       throw err;
     }
 
-    const responseTime = Math.round((performance.now() - startTime) * 100) / 100;
-    const statusCode = response.status || 200;
+    const statusCode = response?.status || 200;
+    const responseSize = parseInt(response?.headers?.get("content-length") || "0", 10) || 0;
+    const wantBody = logResponseBody || statusCode >= 400;
 
-    // Record metrics
-    collector.recordRequest({
-      path,
-      method,
-      statusCode,
-      responseTime,
-      requestSize: parseInt(req.headers.get("content-length") || "0", 10),
-      responseSize: parseInt(response.headers.get("content-length") || "0", 10),
-      consumerIdentifier,
-      consumerName,
-      consumerGroup,
-    });
-
-    // Record errors
-    if (statusCode >= 400 || capturedError) {
-      let errorMessage = capturedError?.message;
-      let errorType = capturedError?.name;
-      let stackTrace = capturedError?.stack;
-
-      if (!errorMessage) {
-        try {
-          const body = await response.clone().text();
-          const parsed = JSON.parse(body);
-          errorMessage = parsed.message || parsed.error;
-          errorType = parsed.name || parsed.type;
-        } catch {}
-      }
-
-      collector.recordError({
-        method,
-        path,
-        statusCode,
-        statusMessage: getStatusMessage(statusCode),
-        errorType,
-        errorMessage,
-        stackTrace,
-        consumerIdentifier,
-        timestamp: startISO,
-        requestLogId,
-        traceId,
-      });
+    if (!wantBody || !response) {
+      core.finish(state, { ...base, statusCode, responseSize });
+      return response;
     }
 
-    // Record request log
-    if (options.requestLogging?.enabled) {
-      const decision = shouldCaptureLog(statusCode, responseTime, options.requestLogging);
-      if (decision.capture) {
-        const entry: RequestLogEntry = {
-          id: requestLogId,
-          method,
-          path,
+    // The body is read from a clone after the response is on its way, so the
+    // client never waits on telemetry. Streams and binary types are skipped
+    // outright by peekBody.
+    void peekBody(response, logResponseBody ? core.maxBodySize : ERROR_BODY_BYTES)
+      .catch(() => undefined)
+      .then((captured) => {
+        core.finish(state, {
+          ...base,
           statusCode,
-          responseTime,
-          requestSize: parseInt(req.headers.get("content-length") || "0", 10),
-          responseSize: parseInt(response.headers.get("content-length") || "0", 10),
-          env: options.env || "dev",
-          consumerIdentifier,
-          timestamp: startISO,
-          sampleRate: decision.sampleRate,
-          traceId,
-          queryParams: Object.fromEntries(url.searchParams.entries()),
-        };
-
-        if (options.requestLogging?.logRequestHeaders) {
-          const rawHeaders: Record<string, string> = {};
-          req.headers.forEach((value, key) => { rawHeaders[key] = value; });
-          entry.requestHeaders = options.requestLogging.maskHeaders
-            ? maskHeaders(rawHeaders, options.requestLogging.maskHeaders)
-            : rawHeaders;
-        }
-
-        collector.recordRequestLog(entry);
-      }
-    }
-
+          responseSize,
+          responseBody: captured
+            ? {
+                text: captured.text,
+                truncated: captured.truncated,
+                totalBytes: responseSize || undefined,
+                contentType: response.headers.get("content-type"),
+              }
+            : undefined,
+        });
+      });
     return response;
   };
-}
 
-function getStatusMessage(code: number): string {
-  const messages: Record<number, string> = {
-    400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
-    404: "Not Found", 405: "Method Not Allowed", 408: "Request Timeout",
-    409: "Conflict", 410: "Gone", 413: "Payload Too Large",
-    415: "Unsupported Media Type", 422: "Unprocessable Content",
-    429: "Too Many Requests", 500: "Internal Server Error",
-    501: "Not Implemented", 502: "Bad Gateway", 503: "Service Unavailable",
-    504: "Gateway Timeout",
-  };
-  return messages[code] || `HTTP ${code}`;
+  return Object.assign(instrumentedFetch, {
+    flush: () => core.flush(),
+    stop: () => core.stop(),
+  });
 }

@@ -3,7 +3,7 @@
 // it never comes back out — not in a URL, not in an error.
 
 import { describe, expect, test } from "bun:test";
-import { configFromEnv, periodSeconds, SentrinelClient, SentrinelError } from "../src/client";
+import { configFromEnv, periodSeconds, retryAfter, SentrinelClient, SentrinelError } from "../src/client";
 
 const KEY = "snt_mcp_0123456789abcdef";
 
@@ -153,5 +153,77 @@ describe("requests", () => {
     expect(calls[0].init.method).toBe("PATCH");
     expect(calls[0].url).toBe("https://api.example/api/issues/abc");
     expect(JSON.parse(String(calls[0].init.body))).toEqual({ status: "ignored" });
+  });
+});
+
+describe("replies that are not the API's", () => {
+  const client = (fetchImpl: typeof fetch, timeoutMs?: number) =>
+    new SentrinelClient({ url: "https://api.example", key: KEY }, fetchImpl, timeoutMs);
+  const reply = (body: string, init: ResponseInit) => (async () => new Response(body, init)) as unknown as typeof fetch;
+
+  test("a web page says the URL is wrong, not \"Unrecognized token '<'\"", async () => {
+    const err = await client(reply("<!doctype html><html>", { status: 200, headers: { "content-type": "text/html; charset=utf-8" } }))
+      .listIssues()
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(SentrinelError);
+    expect(err.message).toMatch(/not the Sentrinel API/);
+    expect(err.message).toContain("SENTRINEL_API_URL");
+    expect(err.message).not.toMatch(/Unrecognized token/);
+  });
+
+  test("a body that is not JSON, whatever its header claims, says the same", async () => {
+    const err = await client(reply("<html>", { status: 200, headers: { "content-type": "application/json" } }))
+      .listIssues()
+      .catch((e) => e);
+    expect(err.message).toMatch(/not the Sentrinel API/);
+  });
+
+  test("an error page from a proxy names the status and both likely causes", async () => {
+    const err = await client(reply("<html>Bad gateway</html>", { status: 502, headers: { "content-type": "text/html" } }))
+      .listIssues()
+      .catch((e) => e);
+    expect(err.status).toBe(502);
+    expect(err.message).toMatch(/502/);
+    expect(err.message).toMatch(/may be down/);
+  });
+
+  test("a plain-text 404 from the API stays a 404", async () => {
+    const err = await client(reply("Not found", { status: 404, headers: { "content-type": "text/plain" } }))
+      .getTrace("t")
+      .catch((e) => e);
+    expect(err.status).toBe(404);
+    expect(err.message).toMatch(/Not found/);
+  });
+
+  test("a 429 says how long to wait, from either form of Retry-After", async () => {
+    const secs = await client(reply("{}", { status: 429, headers: { "content-type": "application/json", "retry-after": "30" } }))
+      .listIssues()
+      .catch((e) => e);
+    expect(secs.status).toBe(429);
+    expect(secs.message).toMatch(/Retry after 30s/);
+
+    const none = await client(reply("{}", { status: 429, headers: { "content-type": "application/json" } }))
+      .listIssues()
+      .catch((e) => e);
+    expect(none.message).toMatch(/Wait a minute/);
+
+    expect(retryAfter(new Date(Date.UTC(2030, 0, 1, 0, 5)).toUTCString(), Date.UTC(2030, 0, 1))).toBe("5 minutes");
+    expect(retryAfter("nonsense")).toBeNull();
+  });
+
+  test("a hung API times out with a sentence, not a hang", async () => {
+    const hang = ((_url: unknown, init: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init.signal?.addEventListener("abort", () => reject(init.signal!.reason));
+      })) as unknown as typeof fetch;
+    const err = await client(hang, 30).listIssues().catch((e) => e);
+    expect(err).toBeInstanceOf(SentrinelError);
+    expect(err.message).toMatch(/did not answer within/);
+  });
+
+  test("every request carries a deadline", async () => {
+    const { fetchImpl, calls } = fakeFetch(200, { issues: [] });
+    await client(fetchImpl).listIssues();
+    expect(calls[0].init.signal).toBeInstanceOf(AbortSignal);
   });
 });

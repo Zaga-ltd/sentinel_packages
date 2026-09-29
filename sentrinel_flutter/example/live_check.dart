@@ -16,9 +16,12 @@ Future<void> main(List<String> args) async {
     appName: 'flutter-demo',
     env: 'prod',
     apiKey: apiKey,
-    consumerIdentifier: 'ios_app',
     flushInterval: const Duration(seconds: 2),
+    tracePropagationTargets: ['backend.test'],
   );
+  // Signed-out traffic is already `guest:<install id>`; this moves it to a
+  // person, the way an app does after sign-in.
+  Sentrinel.identify('live-check-user');
   Sentrinel.setContext({'screen': 'checkout', 'buildChannel': 'beta'});
 
   final client = Sentrinel.httpClient(
