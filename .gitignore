@@ -26,4 +26,5 @@ Claude/
 .claude/
 *.pem
 *.key
-config.bat
+.env
+.env.*
