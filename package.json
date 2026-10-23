@@ -90,7 +90,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "bun run scripts/build.ts"
+    "build": "node init && bun run scripts/build.ts"
   },
   "peerDependencies": {
     "elysia": ">=1.0.0"
